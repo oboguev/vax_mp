@@ -1,0 +1,344 @@
+        .TITLE    TIMESYNC
+        .IDENT    /V1.00/
+
+;;
+;;  Kernel-mode loadable code for SIMH VMS virtual SMP utility.
+;;  Timesync part -- synchronize guest time with host.
+;;
+;;  Tested with OpenVMS VAX version 7.3.
+;;
+;;  Module:     timesync.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev (oboguev@yahoo.com)
+;;  Created:    10-Dec-2011
+;;  Revision History:
+;;              none
+;;
+        .LIBRARY  "SYS$LIBRARY:LIB"
+
+        SYS_DEFS        ; VMS defines
+        XBRANCH         ; Extended branch instructions
+        SIMHDEF         ; SIMH API definitions
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- data
+;;***********************************************************************************
+
+        .PSECT    KLOAD_DATA QUAD, PIC, EXE, NOSHR, WRT
+TIMESYNC_CTRL::                                  ; TimeSync control
+        .BLKB                                    ; SIM_K_TIMESYNC_ON/SIM_K_TIMESYNC_OFF
+
+        .ALIGN    QUAD
+TIMESYNC_TQE:                                    ; TimeSync TQE
+        .BLKB     TQE$C_LENGTH
+
+        .ALIGN    QUAD
+TIMESYNC_ACB:                                    ; TimeSync ACB queued to server process
+        .BLKB     ACB$C_LENGTH
+
+        .ALIGN    LONG
+TIMESYNC_ACB_ACTIVE:                             ; interlock when TimeSync ACB is queued
+        .LONG 0
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- code
+;;***********************************************************************************
+
+        .PSECT    KLOAD_CODE QUAD, PIC, EXE, SHR, NOWRT
+        .ALIGN    LONG
+
+;+
+;
+;  Get and set current TIMESYNC control.
+;
+;       uint32 kcall_get_timesync(uint32* timesync);
+;       uint32 kcall_set_timesync(uint32 timesync);
+;
+;  Returns VMS-structured status.
+;
+;-
+        ARG_TIMESYNC = 4
+;
+        .ENTRY KCALL_GET_TIMESYNC, ^M<>
+        MOVZBL    TIMESYNC_CTRL, @ARG_TIMESYNC(AP)   ; return the value
+        MOVZBL    #SS$_NORMAL, R0                    ; return success status
+        RET                                          ; ...
+
+        .ENTRY KCALL_SET_TIMESYNC, ^M<>
+        MOVB      ARG_TIMESYNC(AP), TIMESYNC_CTRL    ; store the value
+        MOVZBL    #SS$_NORMAL, R0                    ; return success status
+        RET                                          ; ...
+
+;+
+;
+; Set up and activate TimeSync TQE
+;
+; Called at IPL$_TIMER or lower.
+;
+;-
+        .ENABLE   LOCAL_BLOCK
+ACTIVATE_TIMESYNC_TQE::
+        PUSHR     #^M<R2,R3,R4,R5>                 ; save registers
+        ;
+        ;  Initialize ACB
+        ;
+        MOVAB     TIMESYNC_ACB, R5
+        MOVW      #ACB$C_LENGTH, ACB$W_SIZE(R5)    ; init header
+        MOVB      #DYN$C_ACB, ACB$B_TYPE(R5)       ; ...
+        MOVB      #<PSL$C_KERNEL!ACB$M_NODELETE>, -  ; kernel mode AST, non-deletable ACB 
+                  ACB$B_RMOD(R5)                   ; ...
+        CLRL      ACB$L_ASTPRM(R5)                 ; no AST parameter
+        CLRL      ACB$L_KAST(R5)                   ; no special KAST
+        ;
+        ;  Initialize TQE
+        ;
+        MOVAB     TIMESYNC_TQE, R5                 ; address of TQE
+        MOVW      #TQE$C_LENGTH, TQE$W_SIZE(R5)    ; init header
+        MOVB      #DYN$C_TQE, TQE$B_TYPE(R5)       ; ...
+        MOVB      #TQE$C_SSREPT, TQE$B_RQTYPE(R5)  ; ... type = repeatable system subroutine
+        MOVAB     TIMESYNC_SUBR, TQE$L_FPC(R5)     ; address of timer subroutine
+        CLRL      TQE$L_FR3(R5)                    ; R3/R4 passed to subroutine
+        CLRL      TQE$L_FR4(R5)                    ; ...
+        MOVL      #<5 * 10 * 1000 * 1000>, -       ; repeat interval = 5 seconds
+                  TQE$Q_DELTA(R5)                  ; ...
+        CLRL      TQE$Q_DELTA+4(R5)                ; ...
+        ;
+        ;  Queue TQE
+        ;
+        READ_SYSTIME R0                            ; get current time
+        ADDL      TQE$Q_DELTA(R5), R0              ; ... plus delta
+        ADWC      TQE$Q_DELTA+4(R5), R1            ; ... for next scheduled timer due event
+        JSB       G^EXE$INSTIMQ                    ; insert TQE in system queue
+        POPR      #^M<R2,R3,R4,R5>                 ; restore registers
+        RSB                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+; TimeSync timer subroutine.
+;
+; Invoked every 5 seconds at IPL$_TIMER holding no spinlocks to check
+; whether system time should be synchronized from the host.
+;
+; Pseudocode for TIMESYNC_SUBR:
+;
+;     lock HWCLK
+;     get host time
+;     if (exe$gl_timeadjust != 0, i.e. adjustment is active)  goto skip
+;     if (KAST is active)  goto skip
+;     if (guest >= host - 1sec && guest <= host + 1sec)  goto skip
+;     nticks = 450 /* 4.5 seconds */
+;     if (guest < host)
+;     {
+;         tickdelta = (host - guest) / nticks
+;         if (tickdelta.hi || tickdelta.lo > 0xFFFFFFFF - 100000)  goto settime
+;         exe$gl_timeadjust = nticks
+;         exe$gl_ticklength = tickdelta + 100000
+;     }
+;     else
+;     {
+;         if (guest - host > nticks * 95000)  goto settime
+;         tickdelta = (guest - host) / nticks
+;         exe$gl_timeadjust = nticks
+;         exe$gl_ticklength = 100000 - tickdelta
+;     }
+;   skip:
+;     unlock HWCLK
+;     return
+;
+;   settime:
+;     time has to be adjusted by SYS$SETIME executed in process context
+;
+; Maximum adjustments performed by the "short" version are for guest lags up to 53.7 hours behind 
+; the host and for guest running ahead of the host up to few seconds. Longer adjustments are performed 
+; by the "long" version executed via KAST in process context and executing SYS$SETIME.
+;
+; Error Logger is used as the process providing context. (Using swapper would have been ideal, but
+; swapper provides limited process context and executing SYS$SETIME within swapper context crashes
+; the system).
+;
+; Note that the "short" version does *not* change TODR and associated system values (EXE$GL_TODR, 
+; SMP$GL_TODR, EXE$GQ_TODCBASE and the ring buffer in SYSSETIME). They are changed only by the "long" 
+; version of adjustment performed via SYS$SETIME.
+;
+; Note that VMS executes TQEs (including this routine) on the primary processor.
+;
+; ToDo: Rethink what happens if ERL process used as the server is stopped or crashes.
+;       Is it possible for ACB to be left marked busy?
+;
+;-
+        TS_NTICKS = 450                             ; "small" adjustment is performed over 4.5 seconds
+        TS_TOLERANCE = <10 * 1000 * 1000>           ; do not adjust if within 1 sec (10^7 of 100ns units)
+        UINTS_PER_TICK = 100000                     ; number of 100ns units per tick
+        UINTS_PER_TICK_LOW = 950000                 ; number slightly less than 100ns units per tick
+;
+        .ENABLE   LOCAL_BLOCK
+TIMESYNC_SUBR:
+        CMPB      TIMESYNC_CTRL, -                 ; check it TimeSync is enabled
+                  #SIM_K_TIMESYNC_ON               ; ...
+        XBNEQ     310$                             ; neq - disabled, just exit
+        PUSHR     #^M<R2,R3,R4,R5,R9,R10,R11>      ; save registers
+        MOVL      SP, R11                          ; ...
+        MOVPSL    R9                               ; ...
+        ;
+        ;  Acquire HWCLK
+        ;
+        LOCK      LOCKNAME=HWCLK, -                ; acquire HWCLK spinlock and elevate IPL
+                  SAVIPL=R10, -                    ; ... save IPL to R10
+                  PRESERVE=NO                      ; ...
+        ;
+        ;  Query VMM for host time
+        ;
+        CLRQ      -(SP)                            ; set up argument block
+        CLRL      -(SP)                            ; ...
+        PUSHL     #1                               ; ...
+        PUSHL     #VAXMP_API_OP_GETTIME_VMS        ; ...
+        PUSHL     #VAXMP_API_SIGNATURE             ; ...
+        MTPR      SP, #PR$_SIMH                    ; query VMM
+        ADDL      #<3*4>, SP                       ; remove query block header off the stack
+        TSTL      (SP)+                            ; check VMM response status
+        XBEQL     400$                             ; eql - failure, just exit
+        ;
+        ;  See if adjustment is already underway or set-time KAST is active
+        ;
+        TSTL      G^EXE$GL_TIMEADJUST              ; see if adjustment is already underway
+        XBNEQ     400$                             ; neq - underway - just exit
+        ;
+        ;  noniterlocked check for KAST is ok: even if propagation of flag reset from another processor
+        ;  is delayed, we will merely skip this cycle and perform adjustment at the next cycle (but 
+        ;  right after KAST reset guest time should be already in sync with host anyway)
+        ;
+        TSTL      TIMESYNC_ACB_ACTIVE              ; see if KAST may be active 
+        XBNEQ     400$                             ; neq - active - just exit
+        MOVQ      (SP), R0                         ; host time
+        MOVQ      G^EXE$GQ_SYSTIME, R2             ; guest time
+        BICPSW    #PSL$M_IV                        ; disable exceptions on integer overflow (for EDIV below)
+        CMPL      R3, R1                           ; compare quest vs. host
+        BLSSU     30$                              ; ...
+        BGTRU     130$                             ; ...
+        CMPL      R2, R0                           ; ...
+        XBEQL     400$                             ; ... eql - exit
+        BGTRU     130$                             ; ...
+        ;
+        ;  guest < host
+        ;
+30$:
+        SUBL      R2, R0                           ; calculate (host - guest)
+        SBWC      R3, R1                           ; ...
+        TSTL      R1                               ; check if within tolerance
+        BNEQ      31$                              ; ... neq - out of tolerance
+        CMPL      R0, #TS_TOLERANCE                ; ...
+        XBLSSU    400$                             ; ... lssu - within tolerance, exit
+31$:
+        EDIV      #TS_NTICKS, R0, R1, R0           ; (host - guest) / nticks
+        BVS       DO_SETIME                        ; overflow - result is large - use set-time
+        CMPL      R1, #<<^XFFFFFFFF> - UINTS_PER_TICK>  ; is result large?
+        BGTRU     DO_SETIME                        ; gtru - yes - use set-time
+        ADDL3     #UINTS_PER_TICK, R1, -           ; set size of tick delta
+                  G^EXE$GL_TICKLENGTH              ; (systime increment on each tick)
+        MOVZWL    #TS_NTICKS, G^EXE$GL_TIMEADJUST  ; for this number of ticks
+        BRW       400$                             ; restore registers and return
+        ;
+        ;  guest > host
+        ;
+130$:
+        SUBL      R0, R2                           ; calculate (guest - host)
+        SBWC      R1, R3                           ; ...
+        TSTL      R3                               ; check if within tolerance
+        BNEQ      DO_SETIME                        ; ... neq - out of tolerance and "short" correction
+        CMPL      R2, #TS_TOLERANCE                ; ...
+        XBLSSU    400$                             ; ... lssu - within tolerance, exit
+        CMPL      R2, #<TS_NTICKS * UINTS_PER_TICK_LOW>  ; beyond the threshold of "small" adjustment?
+        BGTRU     DO_SETIME                        ; gtru - yes - use set-time
+        EDIV      #TS_NTICKS, R2, R1, R0           ; calculate (guest - host) / nticks
+        SUBL3     R1, #UINTS_PER_TICK, -           ; set size of tick delta
+                  G^EXE$GL_TICKLENGTH              ; (systime increment on each tick)
+        MOVZWL    #TS_NTICKS, G^EXE$GL_TIMEADJUST  ; for this number of ticks
+        BRB       400$                             ; restore registers and return
+        ;
+        ;  Host/guest time divergence is large, perform adjustment via SYS$SETIME
+        ;
+DO_SETIME:
+        UNLOCK    LOCKNAME=HWCLK, -                ; release HWCLK spinlock and revert IPL
+                  PRESERVE=NO, -                   ; ...
+                  NEWIPL=R10                       ; ...
+        TSTL      G^ERL$GL_ERLPID                  ; check if error logger was started
+        BEQL      300$                             ; eql - not yet, exit
+        BBSSI     #0, TIMESYNC_ACB_ACTIVE, 300$    ; check if ACB is busy and mark busy
+        MOVAB     TIMESYNC_ACB, R5                 ; load ACB address
+        MOVAB     TIMESYNC_AST, ACB$L_AST(R5)      ; set AST routine
+        MOVL      G^ERL$GL_ERLPID, ACB$L_PID(R5)   ; set target process PID
+        MOVZBL    #PRI$_TIMER, R2                  ; set priority increment
+        JSB       G^SCH$QAST                       ; fire off AST to the server process
+        BLBS      R0, 300$                         ; queued successfully?
+        XCCBI     #0, TIMESYNC_ACB_ACTIVE          ; if not - mark ACB inactive
+300$:
+        BICW      #^C<PSL$M_IV>, R9                ; restore original state of PSL IV flag
+        BISPSW    R9                               ; ...
+        MOVL      R11, SP                          ; restore registers
+        POPR      #^M<R2,R3,R4,R5,R9,R10,R11>      ; ...
+310$:
+        RSB                                        ; return to the caller
+400$:
+        UNLOCK    LOCKNAME=HWCLK, -                ; release HWCLK spinlock and revert IPL
+                  PRESERVE=NO, -                   ; ...
+                  NEWIPL=R10                       ; ...
+        BRB       300$                             ; restore registers and return
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+; TimeSync AST subroutine.
+;
+; Invoked when divergence between guest time and host time exceeds the threshold of correctable
+; within TIMESYNC_SUBR (i.e. either the lag of up to 53.7 hours or getting ahead by ~ 5 seconds 
+; relative to the host) and therefore full SYS$SETIME correction is required.
+;
+;-
+        TIMESYNC_PRV = <PRV$M_LOG_IO ! PRV$M_OPER ! PRV$M_SYSPRV>   ; privileges required for $SETIME
+
+        .ENTRY    TIMESYNC_AST, ^M<R4,R5,R7>
+        .ENABLE   LOCAL_BLOCK
+        ;
+        ;  Enable privileges required for $SETIME
+        ;
+        MOVL      G^CTL$GL_PCB, R4                 ; get PCB address
+        MOVL      PCB$L_ARB(R4), R5                ; get ARB address
+        MOVQ      ARB$Q_PRIV(R5), -(SP)            ; save ARB privilege mask on the stack
+        MOVL      PCB$L_PHD(R4), R7                ; fetch PHD address
+        MOVQ      PHD$Q_PRIVMSK(R7), -(SP)         ; save PHD privilege mask on the stack
+        BISL      #TIMESYNC_PRV, ARB$Q_PRIV(R5)    ; enable privileges
+        BISL      #TIMESYNC_PRV, PHD$Q_PRIVMSK(R7) ; ...
+        ;
+        ;  Query VMM for host time
+        ;
+        CLRQ      -(SP)                            ; set up argument block
+        CLRL      -(SP)                            ; ...
+        PUSHL     #1                               ; ...
+        PUSHL     #VAXMP_API_OP_GETTIME_VMS        ; ...
+        PUSHL     #VAXMP_API_SIGNATURE             ; ...
+        MTPR      SP, #PR$_SIMH                    ; query VMM
+        ADDL      #<3*4>, SP                       ; remove query block header off the stack
+        TSTL      (SP)+                            ; check VMM response status
+        BEQL      200$                             ; eql - failure, skip SETIME
+        ;
+        ;  Set time
+        ;
+        PUSHL     SP                               ; push address of reported time
+        CALLS     #1, G^SYS$SETIME                 ; set time
+200$:
+        ADDL      #<2*4>, SP                       ; remove time off the stack
+        ;
+        ;  Restore privileges
+        ;
+300$:
+        MOVQ      (SP)+, PHD$Q_PRIVMSK(R7)         ; restore PHD privilege mask
+        MOVQ      (SP)+, ARB$Q_PRIV(R5)            ; restore ARB privilege mask
+        ;
+        ;  Mark ACB inactive and return
+        ;
+        XCCBI     #0, TIMESYNC_ACB_ACTIVE          ; mark ACB inactive
+        RET                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+        .END

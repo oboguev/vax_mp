@@ -1,0 +1,41 @@
+;;
+;;  SIMH VAX MP API and related definitions
+;;
+;;  Module:     simhdef.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev
+;;  Created:    11-Dec-2011
+;;  Revision History:
+;;      none
+;;
+
+        .MACRO    SIMHDEF
+
+        PR$_SIMH = 254             ; register for communication between VAX MP VM and guest system
+
+        SIM_K_IDLE_OFF   = 0       ; CPU idle sleep is disabled
+        SIM_K_IDLE_ON    = 1       ; CPU idle sleep is enabled
+        SIM_K_IDLE_NEVER = 2       ; CPU idle sleep is disabled and cannot be enabled
+
+        SIM_K_TIMESYNC_OFF   = 0   ; TimeSync (syncing system time from host) is disabled
+        SIM_K_TIMESYNC_ON    = 1   ; TimeSync is enabled
+
+        VAXMP_API_SIGNATURE      = ^X484D4953       ; VAX MP API request block signature
+
+        ;
+        ;  VAX MP API request codes
+        ;
+        VAXMP_API_OP_QUERY       = 1
+        VAXMP_API_OP_MEMBAR      = 2
+        VAXMP_API_OP_INIT_SMP    = 3
+        VAXMP_API_OP_START_CPU   = 4
+        VAXMP_API_OP_IPINTR      = 5
+        VAXMP_API_OP_IDLE        = 6
+        VAXMP_API_OP_IDLE_PULSE  = 7
+        VAXMP_API_OP_SET_IDLE    = 8
+        VAXMP_API_OP_GETTIME_VMS = 9
+
+        .MACRO    SIMHDEF
+        .ENDM     SIMHDEF
+
+        .ENDM     SIMHDEF

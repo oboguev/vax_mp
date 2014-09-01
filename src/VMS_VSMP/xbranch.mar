@@ -1,0 +1,113 @@
+;;
+;;  Extended branch commands
+;;
+;;  Module:     xbranch.mar
+;;  Version:    1.0
+;;  Facility:   TCP/IP stack for VAX/VMS
+;;  Author:     Sergey Oboguev
+;;  Created:    12-Dec-1989
+;;  Revision History:
+;;      none
+;;
+
+        .MACRO    XBRANCH
+
+
+;;
+;;   eXtended Branch if EQual
+;;
+        .MACRO    XBEQL LABEL, ?L
+        BNEQ      L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBEQL
+
+
+;;
+;;   eXtended Branch if Not EQual
+;;
+        .MACRO    XBNEQ LABEL, ?L
+        BEQL      L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBNEQ
+
+;;
+;;   eXtended Branch if Greater or EQual
+;;
+        .MACRO    XBGEQ LABEL, ?L
+        BLSS      L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBGEQ
+
+;;
+;;   eXtended Branch if LeSS Unsigned
+;;
+        .MACRO    XBLSSU LABEL, ?L
+        BGEQU     L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBLSSU
+
+;;
+;;   eXtended Branch if Low Bit is Clear
+;;
+        .MACRO    XBLBC FLAG, LABEL, ?L
+        BLBS      FLAG, L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBLBC
+
+
+;;
+;;   eXtended Branch if Bit is Clear
+;;
+        .MACRO    XBBC BIT, FLAGS, LABEL, ?L
+        BBS       BIT, FLAGS, L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBBC
+
+
+;;
+;;   eXtended Branch if Bit is Set
+;;
+        .MACRO    XBBS BIT, FLAGS, LABEL, ?L
+        BBC       BIT, FLAGS, L
+        BRW       LABEL
+L:      .BLKB     0
+        .ENDM     XBBS
+
+
+;;
+;;   Bit Set (non-interlocked) pseudoinstruction
+;;
+        .MACRO    XSSB BIT, FIELD, ?L
+        BBSS      BIT, FIELD, L
+L:      .BLKB     0
+        .ENDM     XSSB
+
+
+;;
+;;   Bit Set (interlocked) pseudoinstruction
+;;
+        .MACRO    XSSBI BIT, FIELD, ?L
+        BBSSI     BIT, FIELD, L
+L:      .BLKB     0
+        .ENDM     XSSBI
+
+
+;;
+;;   Bit Clear (interlocked) pseudoinstruction
+;;
+        .MACRO    XCCBI BIT, FIELD, ?L
+        BBCCI     BIT, FIELD, L
+L:      .BLKB     0
+        .ENDM     XCCBI
+
+
+        .MACRO    XBRANCH
+        .ENDM     XBRANCH
+
+        .ENDM     XBRANCH

@@ -1,0 +1,238 @@
+#
+# makefile for VAX MP for Linux, OS X and Unix
+#
+# To build VAX MP invoke as:
+#
+#    make CONFIG=... USE_NETWORK={1|0} USE_SHARED={1|0} USE_TAP_NETWORK={1|0} USE_VDE_NETWORK={1|0}
+#
+# where possible values for CONFIG are:
+#
+#    x86-dbg   for 32-bit i86 debug build
+#    x86-rel       32-bit i86 release build
+#    x64-dbg       64-bit x86 debug build
+#    x64-rel       64-bit x86 release build
+#
+# To clean the target, invoke
+#
+#    make CONFIG=... clean
+#
+# To rebuild dependency list before building, invoke as
+#
+#    make CONFIG=... depend
+#
+# Suggested sequence for clean rebuild is:
+#
+#    make CONFIG=... clean
+#    make CONFIG=... depend
+#    make CONFIG=... USE_NETWORK={1|0}
+#
+# or
+#
+#    make CONFIG=... rebuild
+#
+# This file assumes that the value for parameters are set appropriately
+# and does not verify them.
+#
+# Parent shell should export OSTYPE variable.
+#
+
+SHELL = /bin/sh
+VAX = vax_mp
+
+ifeq ($(CXX),)
+    CXX = g++
+endif
+
+ifeq (SunOS,$(shell uname))
+    TEST = /bin/test
+else
+    TEST = test
+endif
+
+PDP11D = PDP11
+VAXD = VAX
+EXE =
+
+CFLAGS_M = 
+CFLAGS_D = -DVM_VAX -D VM_VAX_MP -DUSE_INT64 -DUSE_ADDR64 -U__STRICT_ANSI__
+CFLAGS_I = -I. -I$(VAXD) -I$(PDP11D)
+CFLAGS_W = -Wall -Weffc++ -Wundef -Wextra -Wshadow -Wconversion -Wlogical-op -Winline -Wunsafe-loop-optimizations -Wabi -Wno-invalid-offsetof
+# disable warnings for minor issues that better be cleaned up some day
+CFLAGS_W += -Wno-unused-parameter -Wno-shadow -Wno-write-strings -Wno-effc++ -Wno-missing-field-initializers -Wno-conversion
+CFLAGS_W += -Wno-unused-variable -Wno-unused-function -Wno-parentheses -Wno-unsafe-loop-optimizations -Wno-unused-result
+CFLAGS_O = 
+CFLAGS_G = 
+LD_LIBS =
+LDFLAGS = -static-libstdc++ -shared-libgcc
+HAVE_DLOPEN =
+
+# under OS X we use GCC 4.7 that has -Wno-unused-but-set-variable
+# under Linux at this time we are still using GCC 4.4/4.5 that does not have this option
+ifneq (,$(findstring darwin,$(OSTYPE)))
+    CFLAGS_W += -Wno-unused-but-set-variable
+endif
+
+ifneq (,$(findstring linux,$(OSTYPE)))
+    HAVE_DLOPEN = so
+endif
+
+ifneq (,$(findstring darwin,$(OSTYPE)))
+    HAVE_DLOPEN = dylib
+endif
+
+ifneq ($(HAVE_DLOPEN),)
+    CFLAGS_D += -DHAVE_DLOPEN=$(HAVE_DLOPEN)
+    LD_LIBS += -ldl
+endif
+
+ifeq ($(USE_SHARED),1)
+    ifeq ($(HAVE_DLOPEN),)
+        USE_SHARED = 0
+        USE_NETWORK = 1
+    endif
+endif
+
+ifeq ($(USE_NETWORK),1)
+    CFLAGS_D += -DUSE_NETWORK
+    CFLAGS_I += -isystem /usr/local/include 
+    ifeq (usrlib,$(shell if $(TEST) -e /usr/lib/libpcap.a; then echo usrlib; fi))
+        LD_LIBS += /usr/lib/libpcap.a
+    else
+        LD_LIBS += /usr/local/lib/libpcap.a
+    endif
+endif
+
+ifeq ($(USE_SHARED),1)
+    CFLAGS_D += -DUSE_SHARED
+    CFLAGS_I += -isystem /usr/local/include 
+    LD_LIBS += -lpcap -ldl
+endif
+
+ifeq ($(USE_TAP_NETWORK),1)
+    ifneq (,$(findstring darwin,$(OSTYPE)))
+        CFLAGS_D += -DUSE_TAP_NETWORK -DUSE_BSDTUNTAP
+    else
+        CFLAGS_D += -DUSE_TAP_NETWORK
+    endif
+endif
+
+ifeq ($(USE_VDE_NETWORK),1)
+    CFLAGS_D += -DUSE_VDE_NETWORK
+    LD_LIBS += -lvdeplug
+endif
+
+ifeq ($(CONFIG),x86-dbg)
+    CFLAGS_M += -m32 -march=pentium
+    CFLAGS_G += -g -ggdb -g3
+    CFLAGS_O = -O0
+    BIN = $(CONFIG)
+endif
+
+ifeq ($(CONFIG),x64-dbg)
+    CFLAGS_M += -m64
+    CFLAGS_G += -g -ggdb -g3
+    CFLAGS_O = -O0
+    BIN = $(CONFIG)
+endif
+
+ifeq ($(CONFIG),x86-rel)
+    CFLAGS_M += -m32 -march=pentium
+    CFLAGS_O = -O2 -flto -finline-functions -fgcse-after-reload -fpredictive-commoning -fipa-cp-clone
+    #CFLAGS_O = -O3 -flto -fno-unswitch-loops -fno-tree-vectorize
+    LDFLAGS = -flto -fwhole-program $(CFLAGS_O)
+    BIN = $(CONFIG)
+endif
+
+ifeq ($(CONFIG),x64-rel)
+    CFLAGS_M += -m64
+    CFLAGS_O = -O2 -flto -finline-functions -fgcse-after-reload -fpredictive-commoning -fipa-cp-clone
+    #CFLAGS_O = -O3 -flto -fno-unswitch-loops -fno-tree-vectorize
+    LDFLAGS = -flto -fwhole-program $(CFLAGS_O)
+    BIN = $(CONFIG)
+endif
+
+CFLAGS_O += -fno-unsafe-loop-optimizations -fno-strict-overflow
+
+OSTYPE_PROCESSED = no
+
+ifneq (,$(findstring linux,$(OSTYPE)))
+    CFLAGS_D += -D_GNU_SOURCE
+    LD_LIBS += -lrt -lpthread
+    OSTYPE_PROCESSED = yes
+endif
+
+ifneq (,$(findstring solaris,$(OSTYPE)))
+    CFLAGS_D += -D_GNU_SOURCE
+    LD_LIBS += -lm -lsocket -lnsl -lrt -lpthread
+    OSTYPE_PROCESSED = yes
+endif
+
+ifneq (,$(findstring darwin,$(OSTYPE)))
+    CFLAGS_D += -D_GNU_SOURCE
+    LD_LIBS += -lpthread
+    OSTYPE_PROCESSED = yes
+endif
+
+ifeq (no,$(OSTYPE_PROCESSED))
+    CFLAGS_D += -D_GNU_SOURCE
+    LD_LIBS += -lrt -lpthread
+endif
+
+CXXFLAGS = -c $(CFLAGS_M) $(CFLAGS_D) $(CFLAGS_I) $(CFLAGS_W) $(CFLAGS_O) $(CFLAGS_G)
+CMMFLAGS = -MM $(CFLAGS_M) $(CFLAGS_D) $(CFLAGS_I) $(CFLAGS_W) $(CFLAGS_O) $(CFLAGS_G)
+
+SIM_SRC := $(wildcard *.cpp)
+PDP11_SRC := $(wildcard $(PDP11D)/*.cpp)
+VAX_SRC := $(wildcard $(VAXD)/*.cpp)
+ALL_SRC := $(SIM_SRC) $(PDP11_SRC) $(VAX_SRC)
+SIM_H := $(wildcard *.h)
+PDP11_H := $(wildcard $(PDP11D)/*.h)
+VAX_H := $(wildcard $(VAXD)/*.h)
+ALL_H := $(SIM_H) $(PDP11_H) $(VAX_H)
+OBJS := $(addprefix $(BIN)/,$(patsubst %.cpp,%.o,$(notdir $(ALL_SRC))))
+
+.PHONY : all clean rebuild depend $(VAX) ;
+
+all: $(VAX) ;
+
+$(VAX): $(BIN)/$(VAX)$(EXE) ;
+
+depend: $(BIN)-depend.mk ;
+
+rebuild: clean depend $(VAX) ;
+
+clean:
+	-rm -rf $(BIN)
+
+$(BIN)/$(VAX)$(EXE): $(BIN) $(OBJS)
+	@echo Linking $(BIN)/$(VAX)$(EXE) ...
+	@$(CXX) $(LDFLAGS) $(OBJS) $(LD_LIBS) -o $(BIN)/$(VAX)$(EXE) 
+
+$(BIN):
+	mkdir -p $(BIN)
+
+$(BIN)/%.o: %.cpp
+	@echo Compiling $< ...
+	@$(CXX) $(CXXFLAGS) -c $< -o $@ 
+
+$(BIN)/%.o: $(PDP11D)/%.cpp
+	@echo Compiling $< ...
+	@$(CXX) $(CXXFLAGS) -c $< -o $@ 
+
+$(BIN)/%.o: $(VAXD)/%.cpp
+	@echo Compiling $< ...
+	@$(CXX) $(CXXFLAGS) -c $< -o $@ 
+
+#.cpp.o:
+#	$(CXX) $(CXXFLAGS) -c $< -o $@ 
+
+$(BIN)-depend.mk: $(ALL_SRC) $(ALL_H)
+	@echo Building dependencies list ...
+	@mkdir -p $(BIN)
+	@-rm -f $@
+	@-rm -f $@.tmp
+	@$(CXX) $(CMMFLAGS) $(ALL_SRC) >$@.tmp
+	@sed -e's/^\([a-zA-Z0-9]\)/$(BIN)\/\1/' <$@.tmp >$@
+	@rm -f $@.tmp
+
+include $(BIN)-depend.mk

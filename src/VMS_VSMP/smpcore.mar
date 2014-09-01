@@ -1,0 +1,1130 @@
+        .TITLE    SMPCORE
+        .IDENT    /V1.00/
+
+;;
+;;  Kernel-mode loadable code for SIMH VMS virtual SMP utility.
+;;  SMP core part -- provide replacement of SMP$xxx routines supplied by SYSLOA.
+;;
+;;  This module defines SMP-capable version of SMP$xxx routines that override uniprocessor
+;;  version of those routines supplied by SYSLOA650. When VSMP is activated, CPULOA vectors 
+;;  are changed to point to new routines instead of their SYSLOA650 versions.
+;;
+;;  Two of the routines, VSMP$SETUP_CPU and VSMT$START_CPU are located
+;;  in a separate file STARTCPU.MAR.
+;;
+;;  Tested with OpenVMS VAX version 7.3.
+;;
+;;  Module:     smpcore.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev (oboguev@yahoo.com)
+;;  Created:    10-Dec-2011
+;;  Revision History:
+;;              none
+;;
+        .LIBRARY  "SYS$LIBRARY:LIB"
+
+        SYS_DEFS        ; common VMS definitions
+        XBRANCH         ; extended branch instructions
+        $CLUBDEF        ; cluster block structure
+        $VPFLAGSDEF     ; vector processor flags
+
+        XBRANCH         ; Extended branch instructions
+        SIMHDEF         ; SIMH API definitions
+
+        CPU$V_PING == 27    ; bit-code for "ping" interprocessor request
+
+        ;
+        ;  Optimized version of BBCCI: try non-interlocked first
+        ;
+        .MACRO    BBCCI_NI BIT, FIELD, L
+        BBC       BIT, FIELD, L
+        BBCCI     BIT, FIELD, L
+        .ENDM     BBCCI_NI
+
+        ;
+        ;  Perform vector/scalar processors memory synchronization
+        ;
+        .MACRO    VECTOR_MEMORY_SYNC  ?L
+        ASSUME    EXE$V_VP_PRESENT  EQ  0
+        BLBC      G^EXE$GL_VP_FLAGS, L           ; check if vector processor is present
+        MFPR      #PR$_VMAC, -4(SP)              ; perform scalar/vector memory sync
+L:      .BLKB     0
+        .ENDM     VECTOR_MEMORY_SYNC
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- data
+;;***********************************************************************************
+
+        .PSECT    KLOAD_DATA QUAD, PIC, EXE, NOSHR, WRT
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- code
+;;***********************************************************************************
+
+        .PSECT    KLOAD_CODE QUAD, PIC, EXE, SHR, NOWRT
+;++
+;
+; SMP$INTPROC - interrupt a specific processor
+;
+; Inputs: 
+;
+;     R0 = The physical CPU ID of the processor to be interrupted
+;     IPL is ASTDEL or above
+;
+;--
+
+VSMP$INTPROC::                                   ; interrupt the specified processor
+        ROTL      R0, #1, -(SP)                  ; target CPU mask
+        CLRL      -(SP)                          ; status placeholder
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_IPINTR           ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      #<5*4>, SP                     ; remove request block off the stack
+        RSB                                      ; return to the caller
+
+
+;++
+;
+; SMP$INTALL - interrupt all processors in the active set
+;
+; Inputs: 
+;
+;     IPL is ASTDEL or above
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+VSMP$INTALL::                                    ; interrupt all processors
+        PUSHL     R1                             ; save register
+        FIND_CPU_DATA R1                         ; locate CPU database
+        ROTL      CPU$L_PHY_CPUID(R1), #1, R1    ; this CPU ID mask
+        BICL3     R1, G^SMP$GL_ACTIVE_CPUS, R1   ; mask of active CPUs less current
+        BEQL      10$                            ; eql - there are none
+        ;
+        ;  Build SIMH request block and perform the request
+        ;
+        PUSHL     R1                             ; target CPU IDs mask
+        CLRL      -(SP)                          ; status placeholder
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_IPINTR           ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      #<5*4>, SP                     ; remove request block off the stack
+10$:
+        POPL      R1                             ; restore register
+        RSB                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; SMP$INTALL_BIT - interrupt all processors in the active set with work request bit
+;
+; Inputs: 
+;
+;     R2 = work request bit to set
+;     IPL is ASTDEL or above
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+VSMP$INTALL_BIT::
+        PUSHR     #^M<R0,R1,R3,R4>               ; save registers
+        FIND_CPU_DATA R1                         ; locate CPU database
+        ROTL      CPU$L_PHY_CPUID(R1), #1, R1    ; this CPU ID mask
+        BICL3     R1, G^SMP$GL_ACTIVE_CPUS, R1   ; mask of active CPUs less current
+        BEQL      100$                           ; eql - there are none
+        ;
+        ;  Set work bit in CPU DB's of all destination processors
+        ;                                        
+        MOVL      R1, R4                         ; save interrupt destination mask
+        MOVAL     G^SMP$GL_CPU_DATA, R3          ; address of CPU data base vector
+20$:    
+        FFS       #0, #32, R1, R0                ; find next CPU ID                   
+        BEQL      40$                            ; eql - finished
+        BBCC      R0, R1, 30$                    ; clear this CPU's ID in the mask
+30$:    MOVL      (R3)[R0], R0                   ; target CPUs data area
+        BBSSI     R2, CPU$L_WORK_REQ(R0), 20$    ; set work request bit
+        BRB       20$                            ; ...
+        ;
+        ;  Build SIMH request block and perform the request
+        ;
+40$:    PUSHL     R4                             ; target CPU IDs mask
+        CLRL      -(SP)                          ; status placeholder
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_IPINTR           ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      #<5*4>, SP                     ; remove request block off the stack
+100$:
+        POPR      #^M<R0,R1,R3,R4>               ; restore registers
+        RSB                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; SMP$INTALL_ACQ - acquire CPU bitmask mutex and interrupt all processors
+;
+; Inputs: 
+;
+;     IPL is ASTDEL or above
+;
+;--
+
+VSMP$INTALL_ACQ::
+        LOCK      MUTEX=SMP$GL_CPU_MUTEX, -      ; prevent concurrent changes to CPU bitmask
+                  SHARE=YES                      ; ...
+        BSBW      VSMP$INTALL                    ; interrupt other CPUs
+        UNLOCK    MUTEX=SMP$GL_CPU_MUTEX, -      ; release CPU bitmask
+                  SHARE=YES                      ; ...
+        RSB                                      ; return to the caller
+
+
+;++
+;
+; SMP$INTALL_BIT_ACQ - acquire CPU bitmask mutex and interrupt all processors
+;                      with work request bit
+;
+; Inputs: 
+;
+;     R2 = work request bit to set
+;     IPL is ASTDEL or above
+;
+;--
+
+VSMP$INTALL_BIT_ACQ::
+        LOCK      MUTEX=SMP$GL_CPU_MUTEX, -      ; prevent concurrent changes to CPU bitmask
+                  SHARE=YES                      ; ...
+        BSBW      VSMP$INTALL_BIT                ; interrupt other CPUs with work request bit
+        UNLOCK    MUTEX=SMP$GL_CPU_MUTEX, -      ; release CPU bitmask
+                  SHARE=YES                      ; ...
+        RSB                                      ; return to the caller
+
+
+;++
+;
+; SMP$STOP_CPU - CPU-specific kernel mode code for DCL STOP /CPU command
+;
+; Inputs: 
+;
+;     R2 = CPU database address of the target processor
+;
+;--
+
+VSMP$STOP_CPU::
+        .ENABLE   LOCAL_BLOCK
+        CMPB      CPU$B_STATE(R2), -               ; did secondary processor refuse to start?
+                  #CPU$C_BOOT_REJECTED             ; ...
+        BNEQ      10$                              ; no - exit
+        MOVB      #CPU$C_STOPPED, CPU$B_STATE(R2)  ; yes, reset state
+10$:    
+        MOVZBL    #SS$_NORMAL,R0                   ; load success code
+        RSB                                        ; and return to caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; SMP$SHOW_CPU - CPU-specific kernel mode code for DCL SHOW /CPU command,
+;                not called for KA650/KA655
+;
+;--
+
+VSMP$SHOW_CPU::
+        RSB
+
+
+;++
+;
+; SMP$HALT_CPU - CPU-specific code to halt the secondary processor
+;
+; Inputs: 
+;
+;     R3 = CPU database address of the current processor
+;          (NB: may be R2 in earlier VMS versions)
+;     Executing on the secondary processor that is to be halted
+;
+;--
+
+VSMP$HALT_CPU::
+        SETIPL    #IPL$_POWER, -                   ; disable interrupts
+                  ENVIRON=UNIPROCESSOR             ; ...
+        HALT                                       ; HALT (can also do BRB to self)
+
+;++
+;
+; SMP$CONTROLP_CPUS - Determine, if possible, whether any CPUs in the active
+; set have been halted via CTRL-P/HALT. If the console does not provide this 
+; data, assume that some CPU is halted and return the active set.
+;
+; Inputs: 
+;
+;       None.
+;
+; Outputs: 
+;
+;       R0 = Bitmask of CPUs halted via CTRL-P/HALT anded with the active set. 
+;            If cannot determine which CPUs are halted, return just the active mask.
+;
+;--
+
+VSMP$CONTROLP_CPUS::
+        ;; MOVL      G^SMP$GL_ACTIVE_CPUS, R0      ; mask for all active CPUs
+        CLRL      R0                               ; SIMH MicroVAX 39x0 disables console when SMP is active
+        RSB                                        ; ...
+
+
+;++
+;
+; SMP$INVALID_SINGLE - respond to a TBIS IPI request
+;
+; Inputs: 
+;
+;     R1 = CPU database address
+;     SMP$GL_INVALID = address for which to perform invalidate
+;
+; Outputs:
+;
+;     R0, R2 destroyed.
+;
+;-
+
+VSMP$INVALID_SINGLE::
+        .ENABLE   LOCAL_BLOCK
+        MOVL      G^SMP$GL_INVALID, R2             ; save the address to invalidate
+        VECTOR_MEMORY_SYNC                         ; perfrorm vector/scalar processors memory sync
+        ;
+        ;  Raise the flag indicating this CPU had received the request
+        ;
+        XSSBI     CPU$L_PHY_CPUID(R1), G^SMP$GL_ACK_MASK
+        ;
+        ;  Wait here till the interrupting CPU modifies the PTE and says each target CPU 
+        ;  to proceed by asserting each target's TBACK flag
+        ;
+10$:    BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -
+                  INST1=<BBS #CPU$V_TBACK,CPU$L_WORK_REQ(R1),20$>, -
+                  INST2=<BSBB 100$>, -
+                  DONLBL=20$
+        BBCCI     #CPU$V_TBACK, -                  ; check TBACK interlocked and reset it for next request
+                  CPU$L_WORK_REQ(R1), 10$          ; ... (if TBACK was clear when accessed interlocked, go spin again)
+        MTPR      R2, S^#PR$_TBIS                  ; invalidate TLB entry for the requested page
+        RSB                                        ; return to the caller
+
+100$:   XDELTA_WAIT                                ; check if should temporarily enter benign state due to XDelta
+        RSB                                        ; return back into busy-wait loop
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; SMP$SELECT_PRIMARY - verify that the selected CPU (or one of selected CPUs) is a valid candidate to become primary
+;
+; Inputs: 
+;
+;       R5 =  Bitmask of eligible CPUs
+;       IPL = RESCHED
+;
+; Outputs: 
+;
+;       R0 = LBS indicates that CPU represented in R2 is eligible to become primary CPU
+;          = LBC indicates that no CPUs are eligible to become primary
+;       R2 = CPU node id of CPU that will become primary
+;
+;       R1 is destroyed and all other registers are preserved
+;
+;-
+
+VSMP$SELECT_PRIMARY::
+        CLRL      R0                               ; VAX MP does not support switching primary processor
+        RSB                                        ; ...
+
+
+;++
+;
+; SMP$SETUP_SMP - set up overall SMP environment
+;
+;     This routine is called as the last stage of VSMP LOAD command.
+;
+; Inputs:
+;
+;     IPL = 31
+;
+;     SGN$GL_SMP_CPUS = Bitmask of potential CPU nodes that are allowed to be booted
+;
+;     SMP$GL_CPUCONF  = CPU configuration bitmask
+;
+; Outputs:
+;
+;     Affinity for the PRIMARY CPU is established for the OPA0: device.
+;
+;     Multiprocessor environment established
+;
+;--
+
+        .ENABLE   LOCAL_BLOCK
+VSMP$SETUP_SMP::
+        PUSHR     #^M<R0,R1>                       ; preserve scratch registers
+        FIND_CPU_DATA  R1                          ; locate primary CPU's per-CPU database
+        ;
+        ;  Set affinity of OPA0's UCB to the primary CPU
+        ;
+        MOVL      G^OPA$AR_UCB0, R0                ; address of OPA0 UCB
+        CLRL      UCB$L_AFFINITY(R0)               ; set console affinity to the primary CPU
+        ;
+        ;  Initialize the IPINT IPL to the correct value (IPL 22 for VAX MP)
+        ;
+        MOVZBL    #IPL$_IPINTR, G^EXE$GL_IPINT_IPL ; store interprocessor interrupt
+        ;
+        ;  Adjust the virtual console spinlock (same level as IPINT IPL)
+        ;
+        MOVL      G^SMP$AR_SPNLKVEC, R0            ; address of spinlock vector
+        MOVZBL    #SPL$C_VIRTCONS, R1              ; VIRTCONS spinlock index
+        MOVL      (R0)[R1], R0                     ; address of VIRTCONS spinlock
+        MOVL      G^EXE$GL_IPINT_IPL, R1           ; new IPL for VIRTCONS spinlock
+        JSB       G^SMP$ADJUST_IPL                 ; modify the spinlock IPL
+        ;
+        ;  Adjust the INVALIDATE spinlock (one level less than IPINT IPL)
+        ;
+        MOVL      G^SMP$AR_SPNLKVEC, R0            ; address of spinlock vector
+        MOVZBL    #SPL$C_INVALIDATE, R1            ; INVALIDATE spinlock index
+        MOVL      (R0)[R1], R0                     ; address of INVALIDATE spinlock
+        SUBL3     #1, G^EXE$GL_IPINT_IPL, R1       ; new IPL for INVALIDATE spinlock
+        JSB       G^SMP$ADJUST_IPL                 ; modify the spinlock IPL
+        ;
+        ;  Set up the HWCLK IPL appropriate for current processor type (IPL 22 for VAX MP)
+        ;
+        MOVL      G^SMP$AR_SPNLKVEC, R0            ; address of spinlock vector
+        MOVZBL    #SPL$C_HWCLK, R1                 ; HWCLK spinlock index
+        MOVL      (R0)[R1], R0                     ; address of HWCLK spinlock
+        MOVZWL    #22, R1                          ; proper IPL to set for that spinlock
+        JSB       G^SMP$ADJUST_IPL                 ; modify the spinlock IPL
+        ;
+        ;  Update OPA0 DIPL and device spinlock IPL to IPINT IPL
+        ;
+        ;  ToDo: This is likely to be excessive. Rethink whether synchronization
+        ;        with VIRTCONS requires it and if not, then use IPL 20 for OPA0.
+        ;
+        MOVL      G^OPA$AR_IDB, R0                 ; address of OPA0 IDB
+        MOVL      IDB$L_SPL(R0), R0                ; ... and of device spinlock
+        MOVB      G^EXE$GL_IPINT_IPL, -            ; adjust its IPL
+                  SPL$B_IPL(R0)                    ; ...
+        MOVL      G^OPA$AR_UCB0, R0                ; address of OPA0 UCB
+        MOVB      G^EXE$GL_IPINT_IPL, -            ; adjust IPL in the UCB
+                  UCB$B_DIPL(R0)                   ; ...
+        ;
+        ;  Establish the interprocessor interrupt vector in the SCB
+        ;
+        MOVL      G^EXE$GL_SCB, R0                 ; address of SCB
+        MOVAL     W^VSMP$INTSR!1, ^X80(R0)         ; set vector, interrupts taken on IS
+        ;
+        ;  The following bit in EXE$GL_SYS_SPECIFIC area turns on workaround code that
+        ;  is disabled in production versions of OpenVMS and was (presumably) designed
+        ;  as a workaround for microcode or circuitry bug in early pre-production 
+        ;  VAX 6000-400 (Rigel) multiprocessors.
+        ;
+        ;  When this flag is set and page fault is completed on a system page, VMS will
+        ;  execute INVALIDATE_TB on that PTE, broadcasting the change and performing local
+        ;  TBIS. If this flag is not set or page is a process space page, invalidation will
+        ;  not be performed, in a presumption (apparently) that TLBs should not hold PTEs
+        ;  with valid bit off.
+        ;
+        ;  VAX MP currently does not use this workaround, but its existence is mentioned here 
+        ;  just in case it might (though extremely unlikely -- and it should not) come in handy
+        ;  if VAX MP was ever ported to a host platform with very weak memory model.
+        ;
+        ;;;BISL   #1, G^EXE$GL_SYS_SPECIFIC+8      ; turn on "rigel mp workaround"
+
+        POPR      #^M<R0,R1>                       ; restore saved scratch registers
+        RSB                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; VSMP$READ_TODR - replacement for EXE$READ_TODR
+;
+;     This routine reads system-wide TIME-OF-DAY clock (TODR) maintained in the primary processor's TODR.
+;     It is callable on any CPU in the multiprocessor system and will return a valid system TODR value.
+;     If necessary, this routine will utilize interprocessor interrupts to coordinate a TODR value exchange
+;     between the primary CPU and a calling secondary CPU.
+;
+; Inputs:
+;
+;       None
+;
+; Outputs:
+;
+;       R0 = TODR value
+;       All other registers preserved
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+VSMP$READ_TODR::
+;
+;  Regular VMS SMP code elevates during READ_TODR to IPL=RESCHED to block rescheduling
+;  and switching current execution context to another CPU.
+;
+;  Under VAX MP we elevate higher, to SYS_CRITICAL IPL, to additionally cause VAX MP VCPU 
+;  thread priority elevation in order to avoid priority inversion on VCPU threads, with 
+;  regular-priority thread (prone to pre-emption) blocking higher priority thread 
+;  and making it spin uselessly. This could have happened if we acquired SMP$V_TODR
+;  interlock while staying merely at RESCHED, which does not cause VAX MP VCPU thread
+;  priority elevation. To induce thread priority elevation we must raise at least to
+;  SYS_CRITICAL.
+;
+        SAVIPL                                     ; save caller's IPL
+        CMPL      (SP), #IPL$_SYS_CRITICAL         ; if necessary, elevate to the level that
+        BGEQ      10$                              ; ... 1) blocks us from rescheduling to another CPU
+        MTPR      #IPL$_SYS_CRITICAL, S^#PR$_IPL   ; ... 2) elevates VAX MP VCPU thread priority
+;
+;  Check whether we are on the primary CPU and TODR is available locally,
+;  or if we are on the secondary CPU and system TODR is not available locally and we
+;  must request TODR value from the primary
+;
+10$:
+        MOVQ      R1, -(SP)                        ; save scratch registers
+        FIND_CPU_DATA   R1                         ; locate current CPU's per-CPU database
+        ASSUME    CPB$V_PRIMARY EQ 0
+        BLBC      CPU$L_CAPABILITY(R1), 20$        ; if LBC, this is a secondary CPU
+        JSB       G^EXE$READP_LOCAL_TODR           ; TODR is locally available to the primary
+        BRW       50$                              ; common exit to caller
+;
+;  We are on a secondary CPU and must request primary CPU for system TODR value.
+; 
+;  To communicate with the primary, we must first interlock access to the global cells and flags 
+;  used to communicate with the primary reserving them against other secondaries also tryng either 
+;  to get TODR from the primary or set system TODR on the primary, and also against concurrent
+;  time updates on the primary CPU itself.
+;
+;  Note that we may be called at high IPL and therefore must avoid acquiring HWCLK spinlock.
+;
+20$:    BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -    ; spin until SMP$V_TODR is cleared, indicating
+                  DONLBL=30$, -                    ; ... no other TODR operation is in progress
+                  INST1=<BBC #SMP$V_TODR,G^SMP$GL_FLAGS,30$>
+        BBSSI     #SMP$V_TODR, G^SMP$GL_FLAGS, 20$ ; try to interlock access to the primary CPU for TODR operation
+        ;
+        ;  Here we have interlocked against other concurrent TODR operations and reserved access
+        ;  to the global cells and flags required for TODR operation
+        ;
+        CLRL      G^SMP$GL_PROPOSED_TODR           ; indicate TODR read request for the primary
+        IPINT_CPU UPDTODR, G^SMP$GL_PRIMID         ; interrupt primary CPU with a work request for TODR read
+
+        BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -    ; wait for the primary to acknowledge TODR read request
+                  DONLBL=40$, -
+                  INST1=<BBS #SMP$V_TODR_ACK,G^SMP$GL_FLAGS,40$>
+        XCCBI     #SMP$V_TODR_ACK, G^SMP$GL_FLAGS  ; acknowledge receiving primary's response
+;
+;  We have received acknowledgement from the primary that our read request had been served.
+;  Primary had written its TODR value into SMP$GL_NEW_TODR for this CPU to read.
+;
+        MOVL      G^SMP$GL_NEW_TODR, R0            ; read TODR value reported by the primary
+        XCCBI     #SMP$V_TODR, G^SMP$GL_FLAGS      ; release interlock on TODR requests
+50$:    
+        MOVQ      (SP)+, R1                        ; restore scratch registers
+        ENBINT                                     ; restore to caller's original IPL
+        RSB                                        ; return to the caller, with TODR in R0
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; VSMP$WRITE_TODR - replacement for EXE$WRITE_TODR
+;
+;     This routine writes system-wide TIME-OF-DAY clock (TODR) maintained in the primary processor's TODR.
+;     It is callable on any CPU in the multiprocessor system and will return a valid system TODR value.
+;     If necessary, this routine will utilize interprocessor interrupts to coordinate a TODR value exchange
+;     between the primary CPU and a calling secondary CPU.
+;
+; Inputs:
+;
+;       R0 = value to be written into TODR
+;
+; Outputs:
+;
+;       R0 = Updated to contain new TODR, adjusted for delays while performing write operation
+;            in case this routne is called on a secondary CPU.
+;
+;       New time value written into TODR.
+;       All other registers preserved.
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+VSMP$WRITE_TODR::
+;
+;  Regular VMS SMP code elevates during READ_TODR to IPL=RESCHED to block rescheduling
+;  and switching current execution context to another CPU.
+;
+;  Under VAX MP we elevate higher, to SYS_CRITICAL IPL, to additionally cause VAX MP VCPU 
+;  thread priority elevation in order to avoid priority inversion on VCPU threads, with 
+;  regular-priority thread (prone to pre-emption) blocking higher priority thread 
+;  and making it spin uselessly. This could have happened if we acquired SMP$V_TODR
+;  interlock while staying merely at RESCHED, which does not cause VAX MP VCPU thread
+;  priority elevation. To induce thread priority elevation we must raise at least to
+;  SYS_CRITICAL.
+;
+        SAVIPL                                     ; save caller's IPL
+        CMPL      (SP), #IPL$_SYS_CRITICAL         ; if necessary, elevate to the level that
+        BGEQ      10$                              ; ... 1) blocks us from rescheduling to another CPU
+        MTPR      #IPL$_SYS_CRITICAL, S^#PR$_IPL   ; ... 2) elevates VAX MP VCPU thread priority
+;
+;  Check whether we are on the primary CPU and TODR is available locally,
+;  or if we are on the secondary CPU and system TODR is not available locally and we
+;  must request TODR value from the primary
+;
+10$:    
+        PUSHR     #^M<R1,R2,R3>                    ; save scratch registers.
+        FIND_CPU_DATA   R1                         ; locate per-CPU database for local CPU
+        ASSUME    CPB$V_PRIMARY EQ 0
+        BLBC      CPU$L_CAPABILITY(R1), 30$        ; if LBC, this is a secondary CPU
+        JSB       G^EXE$WRITEP_LOCAL_TODR          ; TODR is locally available to the primary
+        BRW       50$                              ; common exit to the caller
+;
+;  We are on a secondary CPU and must request primary CPU to update system TODR value.
+; 
+;  To communicate with the primary, we must first interlock access to the global cells and flags 
+;  used to communicate with the primary reserving them against other secondaries also tryng either 
+;  to get TODR from the primary or set system TODR on the primary, and also against concurrent
+;  time updates on the primary CPU itself.
+;
+;  Note that we may be called at high IPL and therefore must avoid acquiring HWCLK spinlock.
+;
+30$:    BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -    ; check for concurrent TODR operation
+                  DONLBL=35$, -
+                  INST1=<BBC #SMP$V_TODR,G^SMP$GL_FLAGS,35$>
+        BBSSI     #SMP$V_TODR, G^SMP$GL_FLAGS, 30$ ; check again, this time in interlocked fashion
+
+        MOVL      R0, G^SMP$GL_PROPOSED_TODR       ; note proposed TODR value
+        IPINT_CPU UPDTODR, G^SMP$GL_PRIMID         ; and interrupt the primary to set it
+
+40$:    BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -
+                  DONLBL=45$, -
+                  INST1=<BBS #SMP$V_TODR_ACK,G^SMP$GL_FLAGS,45$>
+        BBCCI     #SMP$V_TODR_ACK, -               ; verify that request is complete
+                  G^SMP$GL_FLAGS, 40$              ; ...
+        MOVL      G^SMP$GL_NEW_TODR, R0            ; R0 = adjusted new TODR value
+        XCCBI     #SMP$V_TODR, G^SMP$GL_FLAGS      ; release interlock on TODR requests
+50$:    
+        POPR      #^M<R1,R2,R3>                    ; restore saved caller's registers
+        ENBINT                                     ; restore to caller's original IPL
+        RSB                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; SMP$INTSR - interprocessor interrupt service routine
+;
+;     SMP$INTSR is invoked in response to an interprocessor interrupt.
+;
+;     The interprocessor interrupt is sent in the events listed below.
+;
+;     Note that multiple IP requests to the same processor may occur concurrently or
+;     nearly-simultaneously, in which case multple IP interrupts will coalesce in just one
+;     IP interrupt dispatching and one ISR invocation, therefore ISR must examine all of
+;     IP work request bits and process multiple pending requests in a single pass.
+;
+;     Note that IP interrupt is cleared *before* we start examining work request bits,
+;     so if another IP work request is sent while we examining work bits in this ISR,
+;     then this CPU will receive new IP interrupt and will reexamine work bits again,
+;     so work requests never get lost.
+;
+;     Also note that since both sending IP interrupt and receivng interrupt perform memory
+;     barriers on VAX MP, we can use non-interlocked instructions to examine work request
+;     bits (since paring memory barriers guarantees memory updates propagation), but still
+;     must use interlocked instructions to clear work request bits.
+;
+;     Interprocessor interrupt request is sent in the following events:
+;
+;       - XDELTA. Another processor had entered XDELTA and requesting all other processor
+;         in active set to temporarily pause for the duration of XDELTA session.
+;
+;       - VIRTCONS. Secondary processor requests primary to perform virtual console service,
+;         i.e. reading or writing console registers on behalf of this secondary.
+;
+;       - BUGCHECK processing. Secondary processor that triggered a bugcheck
+;         requests primary to perform bugcheck processing. Then either the primary
+;         or originating secondary request all other processors in the active set
+;         to perform bugcheck processing.
+;
+;       - TBIS. CPU changing TLB entry (typically for system page) requests all
+;         other CPUs to invalidate their TLB entry for this page.
+;
+;       - IOPOST. Other processor entered an entry in IOPOST queue of this processor
+;         and requests it to perform IOPOST processing.
+;
+;       - TBIA. Other CPU performed massive change of PTEs and requests other CPUs
+;         to invalidate all of their TLB entries.
+;
+;       - UPDATE ASTLVL. Other CPU queued AST to the process executing on this processor
+;         and requests this processor to reevaluate it's current process' ASTLVL register.
+;
+;       - WORK FQP. Other processed queued fork entry into the fork queue of this CPU
+;         (for secondaries or primary, to queues in CPU-specific area; for primary only,
+;         additionally into global fork queue) and requests fork processing to be
+;         performed on this CPU.
+;
+;       - TODR. Secondary processor requesting prmary to read or set the value of
+;         its TODR register.
+;
+;       - QLOST. Signals that VAXcluster (VMScluster) quorum had been lost. All processors
+;         in the active set must stay (spin) at IPL$_IOPOST or higher until the quorum is
+;         restored.
+;
+;       - RESCHED. A process whose priority and affinity allows to contend for this CPU
+;         had become computable. Execute rescheduling of this CPU to possibly preempt
+;         current process and schedule new one to be executed on this CPU.
+;
+;       - INV_ISTREAM. Executable system code or global code had been changed by other
+;         processor, which requests all other processors in the active set to invalidate
+;         their instruction prefetch streams.
+;
+;       - PING (not VMS standard, VAX MP specific). Sent by a processor to ping
+;         other processors. As a side effect, ensures memory changes performed by the
+;         sender of this IP request are propagated to the recipients.
+;
+;       - CPU type-specific IP requests. Currently none for VAX MP, except PING which
+;         is however handled in main ISR stream.
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+        .ALIGN    LONG                             ; longword aligned for SCB vector address
+VSMP$INTSR::                                       ; interrupt service routine entry point
+        PUSHR     #^M<R0,R1,R2,R3,R4,R5>           ; save scratch registers
+        PUSHAB    VSMP_INTSR_EXIT                  ; push ISR exit point address so RSB returns to it
+        FIND_CPU_DATA  R1, ISTACK=YES              ; locate per-CPU database
+
+;************************************************************************************************
+;
+;  XDELTA work request handler. 
+;
+;  When CPU enters XDELTA, it requests all other processors in the active state to temporarily
+;  suspend their execution, so debugging session won't be affected by any processors performing
+;  concurrent execution while debugging is in progress.
+;
+;  Therefore the processor that enters XDELTA requests all other CPUs in the active set to
+;  suspend their execution and enter benign state and stay spinning in benign state until the
+;  CPU executing XDELTA exits XDELTA and allows other CPUs to leave benign state and resume
+;  execution.
+;
+;************************************************************************************************
+
+        XDELTA_WAIT                                ; check if should temporarily enter benign state due to XDelta
+
+;************************************************************************************************
+;
+;  Virtual console work request handler.
+;
+;  Vitual console requests are sent by secondary CPUs to the primary, therefore only primary
+;  needs to process them. On the primary, check whether virtual console mode service had been    
+;  requested by a secondary and if so perform it for this secondary.
+;
+;************************************************************************************************
+
+        ASSUME    CPB$C_PRIMARY EQ 0
+        BLBC      CPU$L_CAPABILITY(R1), DO_BUGCHK  ; is this the primary CPU?
+        BSBW      VSMP$VIRTCONS_SERVER             ; lbs - primary - check for virtual console
+                                                   ; ... service requests from the secondaries
+
+;************************************************************************************************
+;
+;  Bugcheck work request handler.
+;
+;  If system bugcheck had been requested by another processor, perform CPUEXIT bugcheck
+;  on this processor. This IP requeset is initially sent by secondary processor that triggered
+;  original bugcheck to the primary, then either primary or originating secondary will send
+;  bugcheck exit request to all the secondaries in the active set.
+;
+;************************************************************************************************
+
+DO_BUGCHK:
+        BBC       #CPU$V_BUGCHK, -                 ; bugcheck code is responsible for clearing
+                  CPU$L_WORK_REQ(R1), DO_INV_TBS   ; ... work request bit
+
+ENTER_BUGCHECK:
+        SETIPL    ENVIRON=UNIPROCESSOR             ; disable interrupts
+;
+;  Bugcheck processing had been requested. Restore the stack to pre-ISR state (except for
+;  interrupt PC/PSL) and enter bugcheck handler by signalling BUG_CHECK on the local processor.
+;
+;  For secondary processors, bugcheck handler will save CPU context to an area in per-CPU database
+;  entry and enter infinite spin loop (e.g. BRB self) until the processor is restarted.
+;
+;  On the primary processor bugcheck handler will perform other activities, including writing
+;  system crash dump, printing console message etc.
+;
+        TSTL      (SP)+                            ; pop ISR exit point address from stack
+        POPR      #^M<R0,R1,R2,R3,R4,R5>           ; restore saved scratch registers
+        BUG_CHECK CPUEXIT, FATAL                   ; enter BUGCHECK handler
+
+;************************************************************************************************
+;
+;  TBIS work request handler.
+;
+;  Perform TBIS request to invalidate TLB entry (typically for system space address).
+;
+;  When interrupting processor requests INV_TBS service, it acquires INVALIDATE spinlock,
+;  stores the address to be invalidated in SMP$GL_INVALID and sends IP request INV_TBS to
+;  target processors (typically all processors in the active set).
+;
+;************************************************************************************************
+
+DO_INV_TBS:
+        BBCCI_NI  #CPU$V_INV_TBS, -                ; check for INV_TBS request
+                  CPU$L_WORK_REQ(R1), -            ; ...
+                  RECHECK_BENIGN                   ; ...
+        BSBW      VSMP$INVALID_SINGLE              ; service INV_TBS request
+
+;************************************************************************************************
+;
+;  Re-check for pending benign state request.
+;
+;************************************************************************************************
+
+RECHECK_BENIGN:
+        BBC       #SMP$V_BENIGN, -                 ; if benign state is not requested, proceed to 
+                  G^SMP$GL_FLAGS, DO_IOPOST        ; ... checking next work request
+;
+;  CPUs had been requested to enter into benign state.
+;  Enter this CPU into benign state and spin in benign state loop.
+;
+;  While spinning in the benign state loop, serve XDELTA, TBIS and BUGCHECK requests
+;  that may be issued by XDELTA (directly and indirectly) while in a benign state.
+;  Also keep checking for benign state being lifted, at which point this CPU can exit
+;  benign state and resume regular processing.
+;
+        XSSBI     CPU$L_PHY_CPUID(R1), -           ; enter this CPU into benign state set
+                  G^XDT$GL_BENIGN_CPUS             ; ...
+10$:    
+        XDELTA_WAIT                                ; check if should serve XDELTA IP request
+                                                   ; ... and temporarily wait in XDELTA benign wait code
+        ;
+        ;  if we have spinned in benign state inside XDELTA_WAIT and resumed,
+        ;  we may have left benign state, but in any event need to re-check
+        ;  for INV_TBS again
+        ;
+        BBCCI_NI  #CPU$V_INV_TBS, -                ; recheck for INV_TBS
+                  CPU$L_WORK_REQ(R1), 20$          ; ...
+        BSBW      VSMP$INVALID_SINGLE              ; service INV_TBS request
+20$:    
+        BBS       #CPU$V_BUGCHK, -                 ; if bugcheck request is pending
+                  CPU$L_WORK_REQ(R1), -            ; ... go process it
+                  ENTER_BUGCHECK                   ; ... and we will never come back 
+        BBS       #SMP$V_BENIGN, -                 ; if still under benign state, go back into
+                  G^SMP$GL_FLAGS, 10$              ; ... benign state server loop
+;
+;  leave benign state
+;
+        XCCBI     CPU$L_PHY_CPUID(R1), -           ; remove this CPU from benign state set
+                  G^XDT$GL_BENIGN_CPUS             ; ... and proceed to checking next work request
+
+;************************************************************************************************
+;
+;  IOPOST work request handler.
+;
+;  If IOPOST processing was requested by another CPU, signal IOPOST on this CPU.
+;
+;************************************************************************************************
+
+DO_IOPOST:
+        BBCCI_NI  #CPU$V_IOPOST, -                 ; check for IOPOST IP request
+                  CPU$L_WORK_REQ(R1), 60$          ; ...
+        SOFTINT   #IPL$_IOPOST                     ; raise local IOPOST processing request
+60$:    
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BEQL      70$                              ; eql -  none, so skip other checks
+
+;************************************************************************************************
+;
+;  TBIA work request handler.
+;
+;  Perform TBIA request to invalidate all TLB entres on this CPU.
+;
+;************************************************************************************************
+
+DO_INV_TBA:
+        BBCCI_NI  #CPU$V_INV_TBA, -                ; check for INV_TBA request
+                  CPU$L_WORK_REQ(R1), DO_UPDASTLVL ; ...
+        VECTOR_MEMORY_SYNC                         ; perfrorm vector/scalar processors memory sync
+        MTPR      #0, S^#PR$_TBIA                  ; invalidate TLB
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BNEQ      DO_UPDASTLVL                     ; neq - continue with other requests
+70$:
+        RSB                                        ; else skip other checks
+
+;************************************************************************************************
+;
+;  Update ASTLVL work request handler.
+;
+;  Update ASTLVL for the process currently executing on this CPU.
+;
+;  This work request bit is set and IP request is sent when a process or system code executing
+;  on another CPU queues an AST to the process currently executing on this CPU (in SCH$QAST). 
+;  Other CPU does not have direct access to this CPU's ASTLVL register, so it has to request
+;  this CPU to update its ASTLVL.
+;
+;  To service the request we must force the process that is current on local CPU to examine its
+;  AST queue. We do this by forcing the current process ASTLVL register to 0 (kernel-mode AST) 
+;  to cause AST interrupt being executed ASAP. In AST interrupt handler the process will
+;  re-examine its AST queue and recalculate new correct value for ASTLVL.
+;
+;  We cannot just recalculate or set ASTLVL directly since IP ISR is executing at high IPL and
+;  thus cannot obtain properly synchronized access to necessary data structures. In particular,
+;  we cannot just read PHD$B_ASTLVL since concurrent multiprocessor access to PHD$L_P0LRASTL 
+;  longword (in SCH$QAST and in SYSCREDEL) may result in a corrupt value being read by local
+;  CPU from PHD$B_ASTLVL.
+;
+;************************************************************************************************
+
+DO_UPDASTLVL:
+        BBCCI_NI  #CPU$V_UPDASTLVL, -              ; check if UPDASTLVL request is pending
+                  CPU$L_WORK_REQ(R1), DO_WORK_FQP  ; ...
+        MOVL      CPU$L_CURPCB(R1), R4             ; get current PCB address
+        MOVL      PCB$L_PHD(R4), R2                ; get PHD address
+        CLRB      PHD$B_ASTLVL(R2)                 ; clear ASTLVL in PHD
+        MTPR      #0, S^#PR$_ASTLVL                ; CPU ASTLVL = KERNEL, force ASTDEL interrupt
+
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BNEQ      DO_WORK_FQP                      ; neq - continue with other requests
+        RSB                                        ; else skip other checks
+
+;************************************************************************************************
+;
+;  CPU work packet request handler.
+;
+;  This IP is received when there is work packet in local CPU-specific work request queue.
+;  On the primary CPU also check for a packet on the system-wide primary work queue.
+;  Remove the packet from the queue and fork it on the local CPU.
+;
+;************************************************************************************************
+
+DO_WORK_FQP:
+        BBCCI_NI  #CPU$V_WORK_FQP, -               ; check if FQP request is pending
+                  CPU$L_WORK_REQ(R1), DO_UPDTODR   ; ...
+
+        CMPL      CPU$L_PHY_CPUID(R1), -           ; is this the primary CPU?
+                  G^SMP$GL_PRIMID                  ; ...
+        BNEQ      110$                             ; neq - secondary, check only per-CPU work queue
+100$:   
+        $REMQHI   G^SMP$GQ_PRIMARY_WORKQ, R5       ; dequeue work queue entry
+        BVS       110$                             ; bvs - queue is empty
+        MOVQ      FKB$L_FR3(R5), R3                ; restore R3 and R4 from fork block
+        PUSHAB    B^100$                           ; fork return addr = dequeue next request
+        PUSHL     FKB$L_FPC(R5)                    ; address of fork routine
+        JMP       G^EXE$FORK                       ; fork it
+        ;
+        ; in ISR context returns to 100$
+        ;
+110$:   
+        $REMQHI   CPU$Q_WORK_FQFL(R1), R5          ; dequeue work queue entry
+        BVS       130$                             ; bvs - queue is empty
+        MOVQ      FKB$L_FR3(R5), R3                ; restore R3 and R4 from fork block
+        PUSHAB    B^110$                           ; fork return addr = dequeue next request
+        PUSHL     FKB$L_FPC(R5)                    ; address of fork routine
+        JMP       G^EXE$FORK                       ; fork it
+        ;
+        ; in ISR context returns to 110$
+        ;
+120$:   RSB                                        ; RSB to VSMP_INTSR_EXIT
+
+130$:   TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BEQL      120$                             ; eql - none, skip other checks
+
+;************************************************************************************************
+;
+;  UPDTODR work request handler.
+; 
+;  Check for interprocessor request to read or update system TODR.
+; 
+;  System TODR is maintained by the primary CPU. Secondary CPUs needing to read, update or 
+;  init system TODR do it by sending IP request to the primary.
+; 
+;  The folowing data cells and flags are used for TODR control:
+; 
+;      SMP$GL_PROPOSED_TODR = identifies requested TODR operation
+;                             -1 => READ WATCH CHIP request (for SCORPIO/8SS CPUs only)
+;                             0 => read TODR request
+;                             other values => write TODR request
+; 
+;      SMP$V_TODR in SMP$GL_FLAGS = bit that interlocks access to SMP$GL_PROPOSED_TODR
+;                             and TODR IP service in general. Secondary CPU requesting TODR
+;                             service performs BBSSI on this flag to reserve temporary exclusive
+;                             access to TODR service and its data cells. When secondary CPU
+;                             requesting TODR IP service receives a response (by observing that
+;                             SMP$V_TODR_ACK had been set by the primary) and reads
+;                             SMP$GL_NEW_TODR, secondary clears SMP$V_TODR_ACK and then
+;                             clears SMP$V_TODR.
+;
+;      SMP$V_TODR_ACK in SMP$GL_FLAGS = this bit is set by the primary after it had processed
+;                             UPDTODR IP request. It is noted by secondary CPU that requested 
+;                             the service and gets cleared by this secondary CPU.
+;
+;      SMP$GL_NEW_TODR = value of TODR returned by the primary. Filled by the primary right
+;                        before it sets SMP$V_TODR_ACK
+;
+;************************************************************************************************
+
+DO_UPDTODR:
+        BBCCI_NI  #CPU$V_UPDTODR, -                ; check if UPDTODR request is pending
+                  CPU$L_WORK_REQ(R1), DO_QLOST     ; ...
+        CMPL      CPU$L_PHY_CPUID(R1), -           ; are we on the primary CPU?
+                  G^SMP$GL_PRIMID                  ; ...
+        BNEQ      150$                             ; no, ignore request
+        JSB       G^SMP$UPDTODR                    ; process update TODR request
+
+150$:   TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BNEQ      DO_QLOST                         ; neq - continue with other requests
+        RSB                                        ; else skip other checks
+
+;************************************************************************************************
+; 
+;  Cluster quorum lost work request handler.
+; 
+;  While the quorum is lost, processors in the active set should execute at IPL$_IOPOST
+;  or higher IPL until VAXcluster (VMScluster) quorum is restored again. On receipt of this
+;  request make this processor spin at IPL=IOPOST until the quorum is restored.
+;
+;  In VMS 7.3 QLOST IP request is no longer used, but it was used in earlier versions.
+;
+;************************************************************************************************
+
+DO_QLOST:
+        BBCCI_NI  #CPU$V_QLOST, -                  ; check if QLOST request is pending
+                  CPU$L_WORK_REQ(R1), DO_RESCHED   ; ...
+        MOVL      G^CLU$GL_CLUB, R0                ; get CLUB address
+        BBS       #CLUB$V_QUORUM, -                ; check if quorum had been regained
+                  CLUB$L_FLAGS(R0), 200$           ; ...
+;
+;  Set up fork block for spinning at IPL$_IOPOST
+;
+        MOVAB     CPU$L_QLOST_FQFL(R1), R5         ; address of FKB in CPU specific area
+        MOVAB     B^210$, FKB$L_FPC(R5)            ; fork PC address
+        MOVB      S^#DYN$C_FRK, FKB$B_TYPE(R5)     ; block type = fork
+        INSQUE    (R5), @CPU$L_PSBL(R1)            ; queue fork block to IOPOST queue
+        SOFTINT   #IPL$_IOPOST                     ; signal IOPOST interrupt
+200$:   
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BNEQ      DO_RESCHED                       ; neq - proceeed with checks
+        RSB                                        ; eql - none more, skip other checks
+;
+;  The code below is executed as fork processing routine.
+;  It will keep resubmitting fork request until the quorum is regained.
+;
+210$:   MOVL      G^CLU$GL_CLUB, R0                ; get CLUB address
+        BBS       #CLUB$V_QUORUM, -                ; check if quorum had been regained
+                  CLUB$L_FLAGS(R0), 220$           ; ...
+;
+;  Quorum is still missing. Queue fork block to the back of IOPOST queue for local CPU
+;  and request IOPOST interrupt.
+;
+        FIND_CPU_DATA  R1                          ; locate per-CPU database
+        INSQUE    (R5), @CPU$L_PSBL(R1)            ; queue fork block to IOPOST queue
+        SOFTINT   #IPL$_IOPOST                     ; signal IOPOST interrupt
+220$:   
+        RSB                                        ; return to fork dispatcher
+
+;************************************************************************************************
+;
+;  RESCHED work request handler.
+;
+;  A process that can execute on this CPU had become computable and at the time of becoming
+;  computable had priority >= this CPU's current process. Request rescheduling to be performed.
+;
+;************************************************************************************************
+
+DO_RESCHED:
+        BBCCI_NI  #CPU$V_RESCHED, -                ; check if RESCHED IP request is pending
+                  CPU$L_WORK_REQ(R1), DO_INV_ISTREAM    ; ...
+        SOFTINT   #IPL$_RESCHED                    ; request local CPU to perform a re-scheduling
+
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BEQL      500$                             ; eql - none more, skip other checks
+
+;************************************************************************************************
+;
+;  INV_ISTREAM work request handler.
+;
+;  This IP s requested by another CPU when it modifies code and instruction prefetch has to be
+;  flushed on other CPUs. Instruction prefetch will be flushed by REI from this IP interrupt
+;  processing.
+;
+;************************************************************************************************
+
+DO_INV_ISTREAM:
+        BBCCI_NI  #CPU$V_INV_ISTREAM, -            ; check if INV_ISTREAM IP request is pending
+                  CPU$L_WORK_REQ(R1), DO_PING      ; ...
+
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BEQL      500$                             ; eql - none more, skip other checks
+
+;************************************************************************************************
+;
+;  PING CPU request handler (VAX MP specific, not a part of VMS IPI protocol).
+;
+;  Just acknowledge we had seen the request.
+;
+;  No longer actually used even on VAX MP, but does not harm to be left here since
+;  this code is never reached (because SPEC_IPINT request set is empty).
+;
+;************************************************************************************************
+
+DO_PING:
+        BBCCI_NI  #CPU$V_PING, -                   ; check if PING IP request is pending
+                  CPU$L_WORK_REQ(R1), 270$         ; ...
+
+        BBSSI     CPU$L_PHY_CPUID(R1), -           ; acknowledge the request
+                  G^SMP$GL_ACK_MASK, 250$          ; ...
+250$:
+        TSTL      CPU$L_WORK_REQ(R1)               ; any work request bits left?
+        BEQL      500$                             ; eql - none more, skip other checks
+
+;************************************************************************************************
+;
+;  CPU-specific IP request handler.
+;
+;  Check for and process CPU-specific requests. This is done at the end of IP ISR processing in
+;  assumption that CPU-specific requests will be relatively infrequent.
+;
+;************************************************************************************************
+
+270$:   BSBW      VSMP$SPEC_IPINT                  ; call CPU-specific service routine
+
+500$:   RSB                                        ; finished processing IP interrupt, RSB to VSMP_INTSR_EXIT
+
+;************************************************************************************************
+;
+;  Dismiss this IP interrupt. All possible reasons for the IP interrupt have been checked
+;  and processed by now.
+;
+;  If any new work requests bits were raised while this interrupt service routine was already
+;  in progress, setting of these bits will also be followed by signalling another IP to this CPU 
+;  sent by the requestor of these bits and this ISR will be invoked again, so new work request
+;  bits will not be missed.
+;
+;************************************************************************************************
+
+VSMP_INTSR_EXIT:
+        POPR      #^M<R0,R1,R2,R3,R4,R5>           ; restore saved scratch registers
+        REI                                        ; and exit the interrupt
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+; 
+; VSMP$SPEC_IPINT - CPU specific IP interrupt service routine
+; 
+;     Determine which CPU specific work request bit is set and dispatch
+;     to the appropriate routine.
+; 
+; Inputs:
+;
+;       R1 = address of this CPU's per-CPU database
+; 
+; Outputs:
+; 
+;       CPU specific work request bits are cleared
+;       
+;--
+VSMP$SPEC_IPINT::
+        RSB
+
+        .END

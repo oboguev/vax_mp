@@ -1,0 +1,13 @@
+        .TITLE    CPU_HOG
+
+        .PSECT    $CODE LONG, SHR, NOWRT, PIC, EXE
+        .ENTRY    MAIN, ^M<>
+LOOP:
+        INCL      VAR
+        CLRL      R0
+        BRB       LOOP
+
+        .PSECT    $DATA LONG, NOSHR, WRT, PIC, NOEXE
+VAR:    .BLKL     1
+
+        .END      MAIN

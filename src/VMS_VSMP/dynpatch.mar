@@ -1,0 +1,2474 @@
+        .TITLE    DYNPATCH
+        .IDENT    /V1.00/
+
+;;
+;;  Kernel-mode loadable code for SIMH VMS virtual SMP utility.
+;;  DynPatch -- apply patches to running system code loaded in memory.
+;;
+;;  Tested with OpenVMS VAX version 7.3.
+;;
+;;  Module:     dynpatch.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev (oboguev@yahoo.com)
+;;  Created:    22-Dec-2011
+;;  Revision History:
+;;              none
+;;
+        .LIBRARY  "SYS$LIBRARY:LIB"
+
+        SYS_DEFS        ; VMS defines
+        XBRANCH         ; Extended branch instructions
+        SIMHDEF         ; SIMH API definitions
+
+        $CRBDEF         ; channel request block
+        $IRPDEF         ; IO request packet
+        $LDRIMGDEF      ; loadable image descriptor
+        $OPDEF          ; VAX opcode definitions
+        $PTEDEF         ; page table entry
+        $VADEF          ; virtual address layout
+        $VBSDEF         ; virtual balance slot flags
+        $VECDEF         ; interrupt vector in CRB
+
+        PATCH_ID_XDELTA == 0             ; patch identifiers
+        PATCH_ID_CHSEP == 1              ; ...
+        PATCH_ID_RESCHED == 2            ; ...
+        PATCH_ID_NUMTIM == 3             ; ...
+        PATCH_ID_LOCKRTRY == 4           ; ...
+        PATCH_ID_XQTIMXMT == 5           ; ...
+        PATCH_ID_UCBTMO == 6             ; ...
+        PATCH_ID_CRBTMO == 7             ; ...
+        PATCH_ID_XQTX1 == 8              ; ...
+        PATCH_ID_XQTX2 == 9              ; ...
+        PATCH_ID_XQTX3 == 10             ; ...
+        PATCH_ID_XQTX4 == 11             ; ...
+        PATCH_ID_XQTX5 == 12             ; ...
+        PATCH_ID_XQTX6 == 13             ; ...
+        PATCH_ID_XQTX7 == 14             ; ...
+        PATCH_ID_XQTX8 == 15             ; ...
+        PATCH_ID_XQTX9 == 16             ; ...
+        PATCH_ID_XQTX10 == 17            ; ...
+        PATCH_ID_XQRX1 == 18             ; ...
+        PATCH_ID_XQRX2 == 19             ; ...
+        PATCH_ID_XQRX3 == 20             ; ...
+        PATCH_ID_XQRX4 == 21             ; ...
+        PATCH_ID_MFYCAP == 22            ; ...
+        PATCH_ID_PU1 == 23               ; ...
+        PATCH_ID_PU2 == 24               ; ...
+        PATCH_ID_PU3 == 25               ; ...
+        PATCH_ID_PU4 == 26               ; ...
+        PATCH_ID_PU5 == 27               ; ...
+        PATCH_ID_PU6 == 28               ; ...
+        PATCH_ID_PU7 == 29               ; ...
+
+        PATCH_ID_END_OF_LIST == 255      ; patch list terminator
+
+        PATCH_DESC_ID = 0                ; patch descriptor layout
+        PATCH_DESC_FLAGS = 1             ; ...
+        PATCH_DESC_LOOKUP_BEGIN = 4      ; ...
+        PATCH_DESC_LOOKUP_END = 8        ; ...
+        PATCH_DESC_TRG_BEGIN = 12        ; ...
+        PATCH_DESC_TRG_END = 16          ; ...
+        PATCH_DESC_REPL_BEGIN = 20       ; ...
+        PATCH_DESC_REPL_END = 24         ; ...
+        PATCH_DESC_LOOKUP_START = 28     ; ...
+        PATCH_DESC_LOOKUP_BEFORE = 32    ; ...
+        PATCH_DESC_LOOKUP_AFTER = 36     ; ...
+        PATCH_DESC_LOOKUP_FOUND = 40     ; ...
+        PATCH_DESC_ERROR_STATUS = 44     ; ...
+        PATCH_DESC_SIZE = 48             ; ...
+
+        PD_V_FILL_NOP = 0                ; fill the remainder of replaced areas with NOPs
+        PD_V_FILL_HALT = 1               ; fill the remainder of replaced areas with HALTs
+                                         ; if neither is set, filled with BPTs
+        PD_V_NOVERIFY = 2                ; complex pattern, do not verify it by memcmp match
+        PD_V_NOAPPLY = 3                 ; do not apply patch
+
+        PD_M_FILL_NOP = <1@PD_V_FILL_NOP>
+        PD_M_FILL_HALT = <1@PD_V_FILL_HALT>
+        PD_M_NOVERIFY = <1@PD_V_NOVERIFY>
+        PD_M_NOAPPLY = <1@PD_V_NOAPPLY>
+
+        ;
+        ;  Macro to emit patch descriptor
+        ;
+        .MACRO    PATCH_DESC ID, ERROR_STATUS, -
+                  FLAGS=0, -
+                  LOOKUP_BEGIN, LOOKUP_END, -
+                  TRG_BEGIN, TRG_END, -
+                  REPL_BEGIN, REPL_END, -
+                  LOOKUP_START, LOOKUP_BEFORE, LOOKUP_AFTER
+
+        $$$DESC = .
+        .BYTE     ID
+        .BYTE     FLAGS
+        .BYTE     0, 0
+
+        .IF NB,<LOOKUP_BEGIN>
+        .LONG     LOOKUP_BEGIN - $$$DESC
+        .LONG     LOOKUP_END - $$$DESC
+        .IFF
+        .LONG     0, 0
+        .ENDC
+
+        .LONG     TRG_BEGIN - $$$DESC
+        .LONG     TRG_END - $$$DESC
+        .LONG     REPL_BEGIN - $$$DESC
+        .LONG     REPL_END - $$$DESC
+
+        .IF NB,<LOOKUP_START>
+        .ADDRESS  G^LOOKUP_START
+        .IFF
+        .LONG     0
+        .ENDC
+
+        .IF NB,<LOOKUP_BEFORE>
+        .LONG     LOOKUP_BEFORE
+        .IFF
+        .LONG     0
+        .ENDC
+
+        .IF NB,<LOOKUP_AFTER>
+        .LONG     LOOKUP_AFTER
+        .IFF
+        .LONG     0
+        .ENDC
+
+        .LONG     0
+        .LONG     ERROR_STATUS
+
+        .ENDM     PATCH_DESC
+
+        .MACRO    ANDL3 A, B, C, TEMP
+        .IF NB,<TEMP>
+        MCOML     A, TEMP
+        BICL3     TEMP, B, C
+        .IFF
+        MCOML     A, -(SP)
+        BICL3     (SP)+, B, C
+        .ENDC
+        .ENDM     ANDL3
+
+        .MACRO    MEMBAR ?L
+;;;
+;;;  Version using BBSSI causes VAX MP to perform thread priority elevation/demotion
+;;;  and is thus more costly than direct service call to the simulator. However
+;;;  the use of direct service call implies MEMBAR should not be called unless the
+;;;  machine is known to be VAX MP, rather than regular SIMH VAX or other simulator
+;;;  or even real VAX.
+;;;
+;;;        BBSSI     #0, -4(SP), L
+;;;L:      .BLKB     0
+;;;
+        CLRL      -(SP)                          ; 0 = full memory barrier
+        PUSHL     S^#VAXMP_API_OP_MEMBAR         ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      S^#<3 * 4>, SP                 ; pop request block off the stack
+        .ENDM
+
+        .MACRO    DEF_PATCH ID
+PATCHDESC_'ID':
+        PATCH_DESC PATCH_ID_'ID', -
+                   ERROR_STATUS=VSMP_MSG_'ID'_P, -
+                   FLAGS=<PD_M_FILL_NOP!PD_M_NOVERIFY>, -
+                   LOOKUP_BEGIN='ID'_LOOK, -
+                   LOOKUP_END='ID'_LOOK_E, -
+                   TRG_BEGIN='ID'_TRG, -
+                   TRG_END='ID'_TRG_E, -
+                   REPL_BEGIN='ID'_REPL, -
+                   REPL_END='ID'_REPL_E
+        .ENDM
+
+        ;
+        ;  Pieces of DEQNA/DELQA buffer descriptor layout and CSR structure
+        ;
+        QNA_XMT$W_FLAG = 0
+        QNA_XMT$W_ADDRHI = 2
+        QNA_XMT$W_ADDR = 4
+        QNA_XMT$W_LEN = 6
+        QNA_XMT$W_STS = 8
+        QNA_XMT$W_TDR = 10
+        QNA_XMT$C_LENGTH = 12
+        ;
+        QNA_XMT$V_FLAG_LAST = 15
+        QNA_XMT$V_DSC_VALID = 15
+        QNA_XMT$V_DSC_CHAIN = 14
+        QNA_XMT$V_STS_LAST = 15
+        QNA_XMT$V_STS_ERR = 14
+        QNA_XMT$V_DSC_EOM = 13
+        QNA_XMT$V_DSC_SETUP = 12
+        ;
+        QNA_XMT$M_FLAG_LAST = <1 @ QNA_XMT$V_FLAG_LAST>
+        QNA_XMT$M_DSC_VALID = <1 @ QNA_XMT$V_DSC_VALID>
+        QNA_XMT$M_DSC_CHAIN = <1 @ QNA_XMT$V_DSC_CHAIN>
+        QNA_XMT$M_DSC_EOM = <1 @ QNA_XMT$V_DSC_EOM>
+        QNA_XMT$M_DSC_SETUP = <1 @ QNA_XMT$V_DSC_SETUP>
+        ;
+        QNA_RCV$W_FLAG = QNA_XMT$W_FLAG
+        QNA_RCV$W_ADDRHI = QNA_XMT$W_ADDRHI
+        QNA_RCV$W_ADDR = QNA_XMT$W_ADDR
+        QNA_RCV$W_LEN = QNA_XMT$W_LEN
+        QNA_RCV$W_STS = QNA_XMT$W_STS
+        QNA_RCV$W_LENB = QNA_XMT$W_STS + 2
+        QNA_RCV$C_LENGTH = QNA_XMT$C_LENGTH
+        ;
+        QNA_RCV$V_DSC_VALID = QNA_XMT$V_DSC_VALID
+        QNA_RCV$V_DSC_CHAIN = QNA_XMT$V_DSC_CHAIN
+        QNA_RCV$V_FLAG_LAST = QNA_XMT$V_FLAG_LAST
+        QNA_RCV$V_STS_LAST = 15
+        QNA_RCV$V_STS_ERR = 14
+        ;
+        QNA_RCV$M_DSC_VALID = <1 @ QNA_RCV$V_DSC_VALID>
+        QNA_RCV$M_DSC_CHAIN = <1 @ QNA_RCV$V_DSC_CHAIN>
+        QNA_RCV$M_FLAG_LAST = <1 @ QNA_RCV$V_FLAG_LAST>
+        ;
+        QNA_CSR$W_CSR = ^XE
+        QNA_CSR$M_XMTINV = ^X10
+        QNA_CSR$M_RCVENA = ^X1
+
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- data
+;;***********************************************************************************
+
+        .PSECT    KLOAD_DATA QUAD, PIC, EXE, NOSHR, WRT
+SV_PTE1:.BLKL                                     ; saved code page PTEs while patching these pages
+SV_PTE2:.BLKL                                     ; ...
+        ;
+        ;  list of patch descriptors
+        ;
+PATCHDESC_LIST:
+        ;
+        ;  XDelta uses WHAMI macro that reads current CPU ID in a machine-specific way.
+        ;
+        ;  XDelta uses the result to interlock XDT ownership between processors and also
+        ;  to determine whether current processor is primary and can perform console IO.
+        ;
+        ;  Since existing VMS WHAMI macro does not cover VAX MP multiprocessor, we need
+        ;  to patch XDelta (if it is loaded) before starting the multiprocessing, so
+        ;  WHAMI code returns correct value.
+        ;
+        ;  On OpenVMS 7.3 target is findable at SYSTEM_DEBUG+00E86.
+        ;
+PATCHDESC_XDELTA:
+        PATCH_DESC PATCH_ID_XDELTA, -
+                   ERROR_STATUS=VSMP_MSG_XDELTA_P, -
+                   FLAGS=0, -
+                   LOOKUP_BEGIN=XDT_LOOK, -       ; for offset calculations only
+                   LOOKUP_END=XDT_LOOK_E, -       ; ... not used for actual lookup
+                   TRG_BEGIN=XDT_TRG, -
+                   TRG_END=XDT_TRG_E, -
+                   REPL_BEGIN=XDT_REPL, -
+                   REPL_END=XDT_REPL_E
+                   ;
+                   ;  Note: real lookup for XDELTA patch target area is performed by patch-specific
+                   ;  LOOKUP_PATCH_XDELTA routine utilizing extended XDT_PAT_LOOK pattern, rather than
+                   ;  XDT_LOOK pattern. XDT_LOOK is recorded in the descriptor merely to indicate
+                   ;  offset between the pattern and target patch area.
+                   ;
+        ;
+        ;  When a process is made computable, SCH$CHSEP signals all idle CPUs and makes
+        ;  them attempt rescheduling. This is acceptable on a real VAX or on VAX MP with
+        ;  idle sleep disabled, but it is wastefull to wake up all virtual processors
+        ;  every time a single VMS process becomes computable.
+        ;
+        ;  CHSEP patch applies more intelligent algorithm for wakeups.
+        ;
+        ;  On OpenVMS 7.3 lookup target is findable at PROCESS_MANAGEMENT+06EB6,
+        ;  patch replacement target (TRG) at PROCESS_MANAGEMENT+06ED2.
+        ;
+PATCHDESC_CHSEP:
+                   ;; CHSEP patch LOOKUP_START is SCH$CHSEP (internal address) + ^xDD
+        PATCH_DESC PATCH_ID_CHSEP, -
+                   ERROR_STATUS=VSMP_MSG_CHSEP_P, -
+                   FLAGS=PD_M_FILL_NOP, -
+                   LOOKUP_BEGIN=CHSEP_LOOK, -
+                   LOOKUP_END=CHSEP_LOOK_E, -
+                   TRG_BEGIN=CHSEP_TRG, -
+                   TRG_END=CHSEP_TRG_E, -
+                   REPL_BEGIN=CHSEP_REPL, -
+                   REPL_END=CHSEP_REPL_E, -
+                   LOOKUP_BEFORE=50, -
+                   LOOKUP_AFTER=50
+        ;
+        ;  When a process is reentered in COM queue, SCH$RESCHED signals all idle CPUs
+        ;  and makes them attempt rescheduling. This is acceptable on a real VAX or
+        ;  on VAX MP with idle sleep disabled, but it is wastefull to wake up all
+        ;  virtual processors every time a single VMS process becomes computable.
+        ;
+        ;  RESCHED patch applies more intelligent algorithm for wakeups.
+        ;
+        ;  On OpenVMS 7.3 lookup target is findable at PROCESS_MANAGEMENT+00EE6,
+        ;  patch replacement target (TRG) at PROCESS_MANAGEMENT+00EE9.
+        ;
+PATCHDESC_RESCHED:
+                   ;; RESCHED patch LOOKUP_START is SCH$RESCHED (internal address) + ^xA2
+        PATCH_DESC PATCH_ID_RESCHED, -
+                   ERROR_STATUS=VSMP_MSG_RESCHED_P, -
+                   FLAGS=PD_M_FILL_NOP, -
+                   LOOKUP_BEGIN=RESCHED_LOOK, -
+                   LOOKUP_END=RESCHED_LOOK_E, -
+                   TRG_BEGIN=RESCHED_TRG, -
+                   TRG_END=RESCHED_TRG_E, -
+                   REPL_BEGIN=RESCHED_REPL, -
+                   REPL_END=RESCHED_REPL_E, -
+                   LOOKUP_BEFORE=80, -
+                   LOOKUP_AFTER=80
+        ;
+        ;  EXE$NUMTIM accesses EXE$GQ_SYSTIME directly without acquiring HWCLK spinlock
+        ;  and with weak consistency checks.
+        ;
+        ;  EXE$GQ_SYSTIME should be accessed while holding HWCLK lock. Otherwise reading
+        ;  it won't be correct on processors with weaker memory consistency model.
+        ;
+        ;  On OpenVMS 7.3 target is findable at MESSAGE_ROUTINES+05373.
+        ;
+PATCHDESC_NUMTIM:
+                   ;; NUMTIM patch LOOKUP_START is MESSAGE_ROUTINES + ^x5373
+                   ;; could also read GST from MESSAGE_ROUTINES.EXE to locate 
+                   ;; the offset of EXE$NUMTIM + 9
+        PATCH_DESC PATCH_ID_NUMTIM, -
+                   ERROR_STATUS=VSMP_MSG_NUMTIM_P, -
+                   FLAGS=PD_M_FILL_NOP, -
+                   LOOKUP_BEGIN=NUMTIM_LOOK, -
+                   LOOKUP_END=NUMTIM_LOOK_E, -
+                   TRG_BEGIN=NUMTIM_TRG, -
+                   TRG_END=NUMTIM_TRG_E, -
+                   REPL_BEGIN=NUMTIM_REPL, -
+                   REPL_END=NUMTIM_REPL_E, -
+                   LOOKUP_BEFORE=400, -
+                   LOOKUP_AFTER=400
+        ;
+        ;  MFYCAP patches SCH$ADD_CPU_CAP/SCH$REMOVE_CPU_CAP to enusure waking up idle CPUs
+        ;  after capability was modified (original VMS code wakes them up before modification)
+        ;
+PATCHDESC_MFYCAP:
+                   ;; in OpenVMS 7.3 MFYCAP patch is located at target + ^XCD,
+                   ;; where target is pointed by SCH$REMOVE_CPU_CAP: .WORD ^M<...>, JMP @#target
+        PATCH_DESC PATCH_ID_MFYCAP, -
+                   ERROR_STATUS=VSMP_MSG_MFYCAP_P, -
+                   FLAGS=PD_M_FILL_NOP, -
+                   LOOKUP_BEGIN=MFYCAP_LOOK, -
+                   LOOKUP_END=MFYCAP_LOOK_E, -
+                   TRG_BEGIN=MFYCAP_TRG, -
+                   TRG_END=MFYCAP_TRG_E, -
+                   REPL_BEGIN=MFYCAP_REPL, -
+                   REPL_END=MFYCAP_REPL_E, -
+                   LOOKUP_BEFORE=150, -
+                   LOOKUP_AFTER=150
+        ;
+        ;
+        ;
+PATCHDESC_UCBTMO:
+                   ;; UCBTMO patch lookup area is at EXE$TIMEOUT (internal address)+^XCB
+        PATCH_DESC PATCH_ID_UCBTMO, -
+                   ERROR_STATUS=VSMP_MSG_UCBTMO_P, -
+                   FLAGS=PD_M_FILL_NOP, -
+                   LOOKUP_BEGIN=UCBTMO_LOOK, -
+                   LOOKUP_END=UCBTMO_LOOK_E, -
+                   TRG_BEGIN=UCBTMO_TRG, -
+                   TRG_END=UCBTMO_TRG_E, -
+                   REPL_BEGIN=UCBTMO_REPL, -
+                   REPL_END=UCBTMO_REPL_E, -
+                   LOOKUP_BEFORE=150, -
+                   LOOKUP_AFTER=150
+PATCHDESC_CRBTMO:
+                   ;; CRBTMO patch lookup area is at EXE$TIMEOUT (internal address)+^X66
+        PATCH_DESC PATCH_ID_CRBTMO, -
+                   ERROR_STATUS=VSMP_MSG_CRBTMO_P, -
+                   FLAGS=PD_M_FILL_NOP, -
+                   LOOKUP_BEGIN=CRBTMO_LOOK, -
+                   LOOKUP_END=CRBTMO_LOOK_E, -
+                   TRG_BEGIN=CRBTMO_TRG, -
+                   TRG_END=CRBTMO_TRG_E, -
+                   REPL_BEGIN=CRBTMO_REPL, -
+                   REPL_END=CRBTMO_REPL_E, -
+                   LOOKUP_BEFORE=90, -
+                   LOOKUP_AFTER=150
+        ;
+        ;  Patches for XQDRIVER, except for XQTIMXMT patch which is handled separately.
+        ;  Purpose for these patches is described in SIMH file PDP11_XQ.CPP, 
+        ;  VAX MP Technical Overview and VAX MP OpenVMS User Guide.
+        ;  In short, provide memory barriers during interaction between DEQNA/DELQA controller
+        ;  and XQDRIVER performed via buffer descriptor list (Rx BDL and Tx BDL).
+        ;
+        DEF_PATCH  XQTX1
+        DEF_PATCH  XQTX2
+        DEF_PATCH  XQTX3
+        DEF_PATCH  XQTX4
+        DEF_PATCH  XQTX5
+        DEF_PATCH  XQTX6
+        DEF_PATCH  XQTX7
+        DEF_PATCH  XQTX8
+        DEF_PATCH  XQTX9
+        DEF_PATCH  XQTX10
+        DEF_PATCH  XQRX1
+        DEF_PATCH  XQRX2
+        DEF_PATCH  XQRX3
+        DEF_PATCH  XQRX4
+        ;
+        ;  Patches for PUDRIVER.
+        ;  Purpose for these patches is described in SIMH file PDP11_RQ.CPP.
+        ;  In short, provide memory barriers during interaction between RQ/TQ handlers
+        ;  and PUDRIVER performed via comm area (cmd/rsp rings and cmd/rsp interrupt indicators).
+        ;
+        DEF_PATCH  PU1
+        DEF_PATCH  PU2
+        DEF_PATCH  PU3
+        DEF_PATCH  PU4
+        DEF_PATCH  PU5
+        DEF_PATCH  PU6
+        DEF_PATCH  PU7
+        ;
+        ;  list terminator
+        ;
+        .BYTE     PATCH_ID_END_OF_LIST            ; end-of-patch-list marker
+        ;
+        ;  end of patch descriptors list
+        ;
+
+;;;
+;;; XDELTA source template (located and matched in loaded XDelta)
+;;;
+XDT_LOOK:
+XDT_TRG:
+        MOVL      (SP),-(SP)
+        CASEB     G^EXE$GB_CPUTYPE, #0, #0
+XDT_TRG_E = . - 2
+XDT_LOOK_E = XDT_TRG_E
+
+;;;
+;;; XDELTA replacement code (replaces XDT_TRG in place)
+;;;
+XDT_REPL:
+        MOVL      (SP), -(SP)
+        MFPR      S^#PR$_CPUID, 4(SP)
+        RSB
+XDT_REPL_E:
+
+;;;
+;;; CHSEP source template (located and matched in loaded executive image)
+;;;
+        .ENABLE   LOCAL_BLOCK
+CHSEP_LOOK:
+10$:    BBSS      R0, G^SCH$GL_COMQS, 20$
+20$:    MOVW      R1, PCB$W_STATE(R4)
+        MOVAQ     G^SCH$AQ_COMT[R0], R2
+        INSQUE    (R4), @(R2)+
+        POPR      #^M<R2,R3,R5,R6>
+        RSB
+CHSEP_TRG:
+30$:    BBC       #CPB$V_IMPLICIT_AFFINITY, -
+                  PCB$L_CAPABILITY(R4), 40$
+        BBSC      PCB$L_AFFINITY(R4), -
+                  G^SCH$GL_IDLE_CPUS, 10$
+40$:    BICL      R5, G^SCH$GL_IDLE_CPUS
+CHSEP_TRG_E:
+        BRB       10$
+CHSEP_LOOK_E:
+        .DISABLE  LOCAL_BLOCK
+
+;;;
+;;; CHSEP replacement code (replaces CHSEP_TRG in place)
+;;;
+CHSEP_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#CHSEP_HANDLER
+CHSEP_REPL_E:
+
+;;;
+;;; RESCHED source template (located and matched in loaded executive image)
+;;;
+RESCHED_LOOK:
+        INSQUE    (R1),@(R2)+
+RESCHED_TRG:
+        CLRL      G^SCH$GL_IDLE_CPUS
+        CLRL      G^VBSS$GL_STALLED_CPUS
+        BICL      #VBS$M_SKP_VBS, G^VBSS$GL_FLAGS
+RESCHED_TRG_E:
+RESCHED_LOOK_E:
+
+;;;
+;;; RESCHED replacement code (replaces RESCHED_TRG in place)
+;;;
+RESCHED_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#RESCHED_HANDLER
+RESCHED_REPL_E:
+
+;;;
+;;; NUMTIM source template (located and matched in loaded executive image)
+;;;
+        .ENABLE   LOCAL_BLOCK
+NUMTIM_LOOK:
+NUMTIM_TRG:
+1$:     MOVQ      G^EXE$GQ_SYSTIME, R1
+        CMPL      G^EXE$GQ_SYSTIME, R1
+        BNEQ      1$
+        CMPL      G^EXE$GQ_SYSTIME+4, R2
+        BNEQ      1$
+NUMTIM_TRG_E:
+NUMTIM_LOOK_E:
+        .DISABLE  LOCAL_BLOCK
+
+;;;
+;;; NUMTIM replacement code (replaces NUMTIM_TRG in place)
+;;;
+NUMTIM_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#NUMTIM_HANDLER
+NUMTIM_REPL_E:
+
+        .ALIGN    LONG
+XQ_XMT_TIMEOUT:                                    ; XQDRIVER's XMT timeout value (in seconds)
+        .BLKL                                      ; ...
+
+
+;;;
+;;; MFYCAP source template (located and matched in loaded executive image)
+;;;
+MFYCAP_LOOK:
+        MOVL    #SS$_NORMAL, R0
+MFYCAP_TRG:
+        UNLOCK  MUTEX=SMP$GL_CPU_MUTEX, PRESERVE=YES, SHARE=YES
+MFYCAP_TRG_E:
+        RET
+MFYCAP_LOOK_E:
+
+;;;
+;;; MFYCAP replacement code (replaces MFYCAP_TRG in place)
+;;;
+MFYCAP_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#MFYCAP_HANDLER
+MFYCAP_REPL_E:
+
+
+;;;
+;;; UCBTMO source template (located and matched in loaded executive image)
+;;;
+        .ENABLE   LOCAL_BLOCK
+UCBTMO_LOOK:
+        BBC       #5, UCB$B_FLCK(R5), 10$
+        FORKLOCK  LOCK=UCB$B_FLCK(R5)
+10$:    DEVICELOCK LOCKADDR=UCB$L_DLCK(R5)
+        SETIPL    #IPL$_POWER, ENVIRON=UNIPROCESSOR
+        BBC       #UCB$V_TIM, UCB$W_STS(R5), 20$
+UCBTMO_TRG:
+        CMPL      UCB$L_DUETIM(R5), G^EXE$GL_ABSTIM
+UCBTMO_TRG_E:
+        BGTRU     20$
+        BICW      #<UCB$M_INT!UCB$M_TIM>, UCB$W_STS(R5)
+        BISW      #UCB$M_TIMOUT, UCB$W_STS(R5)
+        SETIPL    UCB$B_DIPL(R5), ENVIRON=UNIPROCESSOR
+        MOVQ      UCB$L_FR3(R5),R3
+        MOVL      UCB$L_FPC(R5),R2
+        CVTWL     -(R2), -(SP)
+        ADDL      (SP)+, R2
+        JSB       (R2)
+20$:    DEVICEUNLOCK LOCKADDR=UCB$L_DLCK(R5), CONDITION=RESTORE
+UCBTMO_LOOK_E:
+        .DISABLE  LOCAL_BLOCK
+
+;;;
+;;; UCBTMO replacement code
+;;;
+UCBTMO_REPL:
+        JSB       @#^XFFFFFFFF                     ; will be JSB @#UCBTMO_HANDLER
+UCBTMO_REPL_E:
+
+;;;
+;;; CRBTMO source template (located and matched in loaded executive image)
+;;;
+        .ENABLE   LOCAL_BLOCK
+CRBTMO_LOOK:
+        MOVAL     G^IOC$GL_CRBTMOUT, R6
+10$:    MOVL      (R6), R6
+        BEQL      30$
+        FORKLOCK  LOCK=CRB$B_FLCK-CRB$L_TIMELINK(R6)
+CRBTMO_TRG:
+        CMPL      CRB$L_DUETIME-CRB$L_TIMELINK(R6), G^EXE$GL_ABSTIM
+CRBTMO_TRG_E:
+        BGTRU     20$
+        MOVAL     -CRB$L_TIMELINK(R6), R3
+        MNEGL     #1, CRB$L_DUETIME(R3)
+        JSB       @CRB$L_TOUTROUT(R3)
+20$:    FORKUNLOCK LOCK=CRB$B_FLCK-CRB$L_TIMELINK(R6), NEWIPL=#IPL$_TIMER
+        BRB       10$
+CRBTMO_LOOK_E:
+        BRW       CRBTMO_DUMMY_1
+30$:    BRW       CRBTMO_DUMMY_2
+CRBTMO_DUMMY_1:
+CRBTMO_DUMMY_2:
+        .DISABLE  LOCAL_BLOCK
+
+;;;
+;;; CRBTMO replacement code
+;;;
+CRBTMO_REPL:
+        JSB       @#^XFFFFFFFF                     ; will be JSB @#CRBTMO_HANDLER
+CRBTMO_REPL_E:
+
+;;;
+;;; XQTX1 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine UNMAP_XMTBUF
+;;; OpenVMS 7.3 location XQDRIVER + ^X1556
+;;;
+XQTX1_LOOK::
+        MOVL      #1, R0
+XQTX1_TRG:
+        EXTZV     #QNA_XMT$V_STS_ERR, #2, QNA_XMT$W_STS(R6), R2
+XQTX1_TRG_E:
+        CASEB     R2, #0, #3
+XQTX1_LOOK_E::
+
+;;;
+;;; XQTX2 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine UNMAP_XMTBUF
+;;; OpenVMS 7.3 location XQDRIVER + ^X1574
+;;;
+XQTX2_LOOK::
+        MOVL      #10, R5
+XQTX2_TRG:
+        EXTZV     #QNA_XMT$V_STS_ERR, #2, QNA_XMT$W_STS(R6), R2
+XQTX2_TRG_E:
+        CASEB     R2, #0, #3
+XQTX2_LOOK_E::
+
+;;;
+;;; XQTX3 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine UNMAP_XMTBUF
+;;; OpenVMS 7.3 location XQDRIVER + ^X159A
+;;;
+XQTX3_LOOK::
+        INCL      R0
+        MOVL      R6, R5
+        MOVL      ^X0A20(R4)[R1],R6
+XQTX3_TRG:
+        EXTZV     #QNA_XMT$V_STS_ERR, #2, QNA_XMT$W_STS(R6), R2
+XQTX3_TRG_E:
+        CASEB     R2, #0, #2
+XQTX3_LOOK_E::
+
+;
+; "1" in the mask means to ignore the difference in corresponding byte.
+; This way pattern lookup algorithm adapts to variability (across system versions)
+; of structure field offsets encoded into instructions and also branch offsets
+; as long as these offsets remain in the same size (word/byte) category.
+;
+XQTX3_LOOK_MASK::
+        .BYTE     0[2]                             ; INCL
+        .BYTE     0[3]                             ; MOVL
+        .BYTE     0, 0, 0, 1, 1, 0                 ; MOVL
+        .BYTE     0[6]                             ; EXTZV
+        .BYTE     0[4]                             ; CASEB
+XQTX3_LOOK_MASK_E::
+
+XQTX1_REPL: XQTX2_REPL: XQTX3_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX123_HANDLER
+XQTX1_REPL_E: XQTX2_REPL_E: XQTX3_REPL_E:
+
+;;;
+;;; XQTX4 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine UNMAP_XMTBUF
+;;; OpenVMS 7.3 location XQDRIVER + ^X15E6
+;;;
+XQTX4_LOOK::
+        DEVICELOCK LOCKADDR=UCB$L_DLCK(R5), SAVIPL=-(SP), PRESERVE=YES
+        DSBINT    #IPL$_MEGA, ENVIRON=UNIPROCESSOR
+XQTX4_TRG:
+        BBC       #QNA_XMT$V_STS_LAST, QNA_XMT$W_STS(R6), XQTX4_LOOK
+        BBS       #QNA_XMT$V_STS_ERR, QNA_XMT$W_STS(R6), XQTX4_LOOK
+XQTX4_TRG_E:
+        BITW      #QNA_CSR$M_XMTINV, QNA_CSR$W_CSR(R2)
+        BEQL      XQTX4_LOOK
+        ENBINT
+XQTX4_LOOK_E::
+
+XQTX4_LOOK_MASK::
+        ASSUME    <XQTX4_TRG - XQTX4_LOOK> EQ 37
+        .BYTE     0[37]                            ; DEVICELOCK + DSBINT
+        .BYTE     0[4], 1                          ; BBC
+        .BYTE     0[4], 1                          ; BBS
+        .BYTE     0[4]                             ; BITW
+        .BYTE     0, 1                             ; BEQL
+        .BYTE     0[3]                             ; ENBINT
+XQTX4_LOOK_MASK_E::
+
+XQTX4_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX4_HANDLER
+XQTX4_REPL_E:
+
+;;;
+;;; XQRX1 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine NEXTMSG
+;;; OpenVMS 7.3 location XQDRIVER + ^X12EB
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQRX1_LOOK::
+        MOVZBL    ^X08A0(R4), R6
+        MOVL      ^X09A0(R4)[R6], R6
+XQRX1_TRG:
+        BBC       #QNA_RCV$V_STS_LAST, QNA_RCV$W_STS(R6), 10$
+        BBC       #QNA_RCV$V_STS_ERR, QNA_RCV$W_STS(R6), XQRX1_LOOK
+10$:    CMPB      QNA_RCV$W_LENB(R6), QNA_RCV$W_LENB+1(R6)
+XQRX1_TRG_E:
+        BNEQ      XQRX1_LOOK
+        MOVL      G^EXE$GL_ABSTIM_TICS, ^X96(R4)
+XQRX1_LOOK_E::
+
+XQRX1_LOOK_MASK::
+        .BYTE     0, 0, 1, 1, 0                    ; MOVZBL
+        .BYTE     0, 0, 0, 1, 1, 0                 ; MOVL
+        .BYTE     0[5]                             ; BBC
+        .BYTE     0[4], 1                          ; BBC
+        .BYTE     0[5]                             ; CMPB
+        .BYTE     0, 1                             ; BNEQ
+        .BYTE     0[7], 1, 1                       ; MOVL
+XQRX1_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQRX1_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQRX1_HANDLER
+XQRX1_REPL_E:
+
+;;;
+;;; XQRX2/XQTX5 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine INIT_DEQNA
+;;; OpenVMS 7.3 location XQDRIVER + ^XADA
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQRX2_LOOK::
+XQTX5_LOOK::
+        MOVZBL    ^X810(R4), R7
+10$:    MOVW      #QNA_RCV$M_FLAG_LAST, QNA_RCV$W_FLAG(R1)
+        CLRW      QNA_RCV$W_STS(R1)
+XQRX2_TRG:
+        BICW      #<QNA_RCV$M_DSC_CHAIN!QNA_RCV$M_DSC_VALID>, QNA_RCV$W_ADDRHI(R1)
+XQRX2_TRG_E:
+        MNEGW     R0, QNA_RCV$W_LEN(R1)
+        ADDL      #QNA_RCV$C_LENGTH, R1
+        SOBGTR    R7, 10$
+        MOVAB     ^XB10(R4), R1
+        MOVZBL    ^X810(R4), R7
+20$:    MOVW      #QNA_XMT$M_FLAG_LAST, QNA_XMT$W_FLAG(R1)
+        CLRW      QNA_XMT$W_STS(R1)
+XQTX5_TRG:
+        BICW      #<QNA_XMT$M_DSC_CHAIN!QNA_XMT$M_DSC_VALID>, QNA_XMT$W_ADDRHI(R1)
+XQTX5_TRG_E:
+        ADDL      #QNA_XMT$C_LENGTH, R1
+        SOBGTR    R7, 20$
+XQRX2_LOOK_E::
+XQTX5_LOOK_E::
+
+XQRX2_LOOK_MASK::
+XQTX5_LOOK_MASK::
+        .BYTE     0, 0, 1, 1, 0     ; MOVZBL
+        .BYTE     0[5]              ; MOVW
+        .BYTE     0[3]              ; CLRW
+        .BYTE     0[6]              ; BICW
+        .BYTE     0[4]              ; MNEGW
+        .BYTE     0[3]              ; ADDL
+        .BYTE     0[3]              ; SOBGTR
+        .BYTE     0, 0, 1, 1, 0     ; MOVAB
+        .BYTE     0, 0, 1, 1, 0     ; MOVZBL
+        .BYTE     0[5]              ; MOVW
+        .BYTE     0[3]              ; CLRW
+        .BYTE     0[6]              ; BICW
+        .BYTE     0[3]              ; ADDL
+        .BYTE     0[3]              ; SOBGTR
+XQRX2_LOOK_MASK_E::
+XQTX5_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQRX2_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQRX2_HANDLER
+XQRX2_REPL_E:
+XQTX5_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX5_HANDLER
+XQTX5_REPL_E:
+
+;;;
+;;; XQTX6 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine QNA_XMIT
+;;; OpenVMS 7.3 location XQDRIVER + ^XE89
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQTX6_LOOK::
+        BSBW      XQTX6_LOOK
+XQTX6_TRG:
+        BISW      #<QNA_XMT$M_DSC_VALID!QNA_XMT$M_DSC_EOM>, R8
+        MOVW      R8, QNA_XMT$W_ADDRHI(R6)
+XQTX6_TRG_E:
+        POPR      #^M<R6,R8>
+        BISW      #QNA_XMT$M_DSC_VALID, R8
+        BRW       XQTX6_LOOK
+XQTX6_LOOK_E::
+
+XQTX6_LOOK_MASK::
+        .BYTE     0, 1, 1      ; BSBW
+        .BYTE     0[5]         ; BISW
+        .BYTE     0[4]         ; MOVW
+        .BYTE     0[4]         ; POPR
+        .BYTE     0[5]         ; BISW
+        .BYTE     0, 1, 1      ; BRW
+XQTX6_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQTX6_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX6_HANDLER
+XQTX6_REPL_E:
+
+;;;
+;;; XQTX7/XQTX8 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine UNMAP_XMTBUF
+;;; OpenVMS 7.3 location XQDRIVER + ^X16A2
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQTX7_LOOK::
+XQTX8_LOOK::
+        INCB      ^X880(R4)
+        BICB      ^X882(R4), ^X870(R4)
+XQTX7_TRG:
+        BICW      #QNA_XMT$M_DSC_VALID, QNA_XMT$W_ADDRHI(R5)
+XQTX7_TRG_E:
+        DECB      ^XD0(R4)
+        BEQL      10$
+        MOVB      ^X0D51(R4), ^X0D50(R4)
+10$:    INCB      ^X880(R4)
+        BICB      ^X890(R4), ^X0880(R4)
+XQTX8_TRG:
+        BICW      #QNA_XMT$M_DSC_VALID, QNA_XMT$W_ADDRHI(R6)
+XQTX8_TRG_E:
+        CMPB      #DYN$C_VCRP, IRP$B_TYPE(R3)
+XQTX7_LOOK_E::
+XQTX8_LOOK_E::
+
+XQTX7_LOOK_MASK::
+XQTX8_LOOK_MASK::
+        .BYTE     0, 0, 1, 1            ; INCB
+        .BYTE     0, 0, 1, 1, 0, 1, 1   ; BICB
+        .BYTE     0[6]                  ; BICW
+        .BYTE     0, 0, 1, 1            ; DECB
+        .BYTE     0[2]                  ; BEQL
+        .BYTE     0, 0, 1, 1, 0, 1, 1   ; MOVB
+        .BYTE     0, 0, 1, 1            ; INCB
+        .BYTE     0, 0, 1, 1, 0, 1, 1   ; BICB
+        .BYTE     0[6]                  ; BICW
+        .BYTE     0[5]                  ; CMPB
+XQTX7_LOOK_MASK_E::
+XQTX8_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+
+XQTX7_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX7_HANDLER
+XQTX7_REPL_E:
+XQTX8_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX8_HANDLER
+XQTX8_REPL_E:
+
+;;;
+;;; XQTX9 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine XMT_COMPLETE
+;;; OpenVMS 7.3 location XQDRIVER + ^X1485
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQTX9_LOOK::
+        MOVL      R0, R1
+        ASHL      #16, R0, R0
+        MOVW      #SS$_NORMAL, R0
+XQTX9_TRG:
+        MOVL      G^EXE$GL_ABSTIM_TICS, ^XA8(R4)
+        BBSC      #QNA_XMT$V_DSC_SETUP, QNA_XMT$W_ADDRHI(R6), XQTX9_LOOK
+XQTX9_TRG_E:
+        BSBW      XQTX9_LOOK
+        JSB       @^X720(R4)
+XQTX9_LOOK_E::
+
+XQTX9_LOOK_MASK::
+        .BYTE     0[3]                  ; MOVL
+        .BYTE     0[4]                  ; ASHL
+        .BYTE     0[3]                  ; MOVW
+        .BYTE     0[7], 1, 1            ; MOVL
+        .BYTE     0[4], 1               ; BBSC
+        .BYTE     0, 1, 1               ; BSBW
+        .BYTE     0, 0, 1, 1            ; JSB
+XQTX9_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQTX9_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX9_HANDLER
+XQTX9_REPL_E:
+
+;;;
+;;; XQTX10 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine QNA_XMIT
+;;; OpenVMS 7.3 location XQDRIVER + ^XEF3
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQTX10_LOOK::
+        BISW      #QNA_XMT$M_DSC_SETUP, R8
+        MOVL      ^X0870(R4), R2
+        BICW      #QNA_CSR$M_RCVENA, QNA_CSR$W_CSR(R2)
+XQTX10_TRG:
+        DEVICELOCK LOCKADDR=UCB$L_DLCK(R5), -
+                  SAVIPL=-(SP), -
+                  PRESERVE=NO
+        MOVW      R8, QNA_XMT$W_ADDRHI(R6)
+XQTX10_TRG_E:
+XQTX10_LOOK_E::
+
+XQTX10_LOOK_MASK::
+        .BYTE     0[5]             ; BISW
+        .BYTE     0, 0, 1, 1, 0    ; MOVL
+        .BYTE     0[4]             ; BICW
+        ASSUME    <XQTX10_TRG_E - XQTX10_TRG> EQ 30
+        .BYTE     0[26]            ; DEVICELOCK
+        .BYTE     0[4]             ; MOVW
+XQTX10_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQTX10_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQTX10_HANDLER
+XQTX10_REPL_E:
+
+;;;
+;;; XQRX3 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine QNA_START_RECEIVE
+;;; OpenVMS 7.3 location XQDRIVER + ^XCDB
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQRX3_LOOK::
+        MOVL      (R7), <CRB$L_INTD+VEC$W_MAPALT>(R1)
+        JSB       G^IOC$LOADALTMAP
+        BLBS      R0, 10$
+        BRW       XQRX3_LOOK
+10$:
+        MOVQ      (SP)+, R3
+        MOVW      #1, QNA_RCV$W_LENB(R6)
+XQRX3_TRG:
+        BISW      #QNA_RCV$M_DSC_VALID, QNA_RCV$W_ADDRHI(R6)
+XQRX3_TRG_E:
+XQRX3_LOOK_E::
+
+XQRX3_LOOK_MASK::
+        .BYTE     0[4]                  ; MOVL
+        .BYTE     0[6]                  ; JSB
+        .BYTE     0[3]                  ; BLBS
+        .BYTE     0, 1, 1               ; BRW
+        .BYTE     0[3]                  ; MOVQ
+        .BYTE     0[4]                  ; MOVW
+        .BYTE     0[6]                  ; BISW
+XQRX3_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQRX3_REPL:
+        JSB       @#^X80001234                     ; will be JSB @#XQRX3_HANDLER
+XQRX3_REPL_E:
+
+;;;
+;;; XQRX4 patch source template, located and matched in loaded XQDRIVER
+;;; Module [PHV_LAN.SRC]DEQNA.MAR, routine NEXTMSG
+;;; OpenVMS 7.3 location XQDRIVER + ^X1307
+;;;
+        .ENABLE   LOCAL_BLOCK
+XQRX4_LOOK::
+        MOVL      G^EXE$GL_ABSTIM_TICS, ^X110(R4)
+        REMQUE    @^X250(R4), R2
+        BVS       XQRX4_LOOK
+        DECB      ^X1CE(R4)
+        INCB      ^X8A0(R4)
+XQRX4_TRG:
+        BICB      ^X8A6(R4), ^X8A0(R4)
+        BBCC      #QNA_RCV$V_DSC_VALID, QNA_RCV$W_ADDRHI(R6), 10$
+10$:
+XQRX4_TRG_E:
+        BBC       #QNA_RCV$V_STS_LAST, QNA_RCV$W_STS(R6), XQRX4_LOOK
+XQRX4_LOOK_E::
+
+XQRX4_LOOK_MASK::
+        .BYTE     0[7], 1, 1            ; MOVL
+        .BYTE     0, 0, 1, 1, 0         ; REMQUE
+        .BYTE     0, 1                  ; BVS
+        .BYTE     0, 0, 1, 1            ; DECB
+        .BYTE     0, 0, 1, 1            ; INCB
+        .BYTE     0, 0, 1, 1, 0, 1, 1   ; BICB
+        .BYTE     0[5]                  ; BBCC
+        .BYTE     0[4], 1               ; BBC
+XQRX4_LOOK_MASK_E::
+        .DISABLE  LOCAL_BLOCK
+
+XQRX4_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#XQRX4_HANDLER
+XQRX4_REPL_E:
+
+;;;
+;;; PU1 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine PU$INT
+;;; OpenVMS 7.3 location PUDRIVER + ^X2D40
+;;;
+PU1_LOOK::
+        MOVL      @(SP)+, R3
+        MOVL      IDB$L_OWNER(R3), R5
+PU1_DLCK:
+        DEVICELOCK LOCKADDR=UCB$L_DLCK(R5), -
+                   CONDITION=NOSETIPL, PRESERVE=NO
+PU1_DLCK_E:
+        MOVL      ^X100(R5), R4
+        MOVL      ^X300(R4), R3
+PU1_RCSR:
+        READ_CSR  @^XDA(R5), 188(R5), LENGTH=WORD
+PU1_RCSR_E:
+PU1_TRG:
+        MOVL      ^X400(R4), R0
+PU1_LOOK_BEQL:
+        BEQL      PU1_LOOK_E
+PU1_TRG_E:
+PU1_LOOK_E::
+
+         ;
+         ;  READ_CSR_SA_UDASA_MASK is likely to depend on VMS version
+         ;
+        .MACRO    READ_CSR_SA_UDASA_MASK
+        RCSR_SA_UDASA_MASK = .
+        .BYTE     0[8]                  ; BBC
+        .BYTE     0[2]                  ; CLRL
+        .BYTE     0[2]                  ; PUSHL
+        .BYTE     0[6]                  ; PUSHL
+        .BYTE     0[2]                  ; PUSHL
+        .BYTE     0, 0, 1, 1            ; PUSHAL
+        .BYTE     0[7]                  ; CALLS
+        .BYTE     0, 0, 0, 1, 1         ; CVTLW
+        .BYTE     0[2]                  ; BRB
+        .BYTE     0, 0, 1, 1, 0, 1, 1   ; MOVW
+        RCSR_SA_UDASA_MASK_E = .
+        .ENDM
+
+PU1_LOOK_MASK::
+        .BYTE     0[3]                  ; MOVL
+        .BYTE     0[4]                  ; MOVL
+        ASSUME    <PU1_DLCK_E - PU1_DLCK> EQ 17
+        .BYTE     0[17]                 ; DEVICELOCK
+        .BYTE     0, 0, 1, 1, 0         ; MOVL
+        .BYTE     0, 0, 1, 1, 0         ; MOVL
+        READ_CSR_SA_UDASA_MASK          ; READ_CSR
+        ASSUME    <PU1_RCSR_E - PU1_RCSR> EQ <RCSR_SA_UDASA_MASK_E - RCSR_SA_UDASA_MASK>
+        .BYTE     0, 0, 1, 1, 0         ; MOVL
+        .BYTE     0, 1                  ; BEQL
+PU1_LOOK_MASK_E::
+
+PU1_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU1_HANDLER
+PU1_REPL_E:
+
+;;;
+;;; PU2 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine INSERT_IN_RRING
+;;; OpenVMS 7.3 location PUDRIVER + ^X2842
+;;;
+PU2_LOOK::
+        EXTZV     #0,^X3FA(R4),^X28C(R4),R0
+        MOVL      R2,^X31E(R4)[R0]
+        MOVB      R0,6(R2)
+        MOVB      #1,7(R2)
+        SUBL3     #^X12,^X3C2(R4),^X12(R2)
+PU2_TRG:
+        MOVL      ^XA(R2),^X412(R4)[R0]
+PU2_TRG_E:
+        ADAWI     #1,^X28A(R4)
+        INCB      ^X28C(R4)
+        RSB
+PU2_LOOK_E::
+
+PU2_LOOK_MASK::
+        .BYTE     0, 0, 0, 1, 1, 0, 1, 1, 0      ; EXTZV
+        .BYTE     0, 0, 0, 0, 1, 1               ; MOVL
+        .BYTE     0, 0, 0, 1                     ; MOVB
+        .BYTE     0, 0, 0, 1                     ; MOVB
+        .BYTE     0, 1, 0, 1, 1, 0, 1            ; SUBL3
+        .BYTE     0, 0, 1, 0, 0, 1, 1            ; MOVL
+        .BYTE     0, 0, 0, 1, 1                  ; ADAWI
+        .BYTE     0, 0, 1, 1                     ; INCB
+        .BYTE     0                              ; RSB
+PU2_LOOK_MASK_E::
+
+PU2_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU2_HANDLER
+PU2_REPL_E:
+
+;;;
+;;; PU3 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine POLL_RSPRING
+;;; OpenVMS 7.3 location PUDRIVER + ^X3066
+;;;
+
+        .ENABLE   LOCAL_BLOCK
+PU3_LOOK::
+        JSB       G^EXE$IOFORK
+        BICW      #3,UCB$W_DEVSTS(R5)
+        TSTW      ^XBC(R5)
+        BLSS      PU3_LOOK
+        BBS       #5,UCB$W_DEVSTS(R5),PU3_LOOK
+        BBS       #UCB$V_POWER,UCB$W_STS(R5),PU3_LOOK
+        BBCC      #0,^XEC(R5),10$
+        BSBW      PU3_LOOK
+10$:
+        CLRW      ^XEC(R5)
+        TSTW      ^X28C(R4)
+        BNEQ      30$
+20$:
+        RSB
+30$:
+PU3_TRG:
+        EXTZV     #0,^X3FA(R4),^X28C(R4),R0
+        TSTL      ^X412(R4)[R0]
+PU3_TRG_E:
+        BLSS      20$
+PU3_LOOK_E::
+        .DISABLE  LOCAL_BLOCK
+
+PU3_LOOK_MASK::
+        .BYTE     0[6]                           ; JSB (IOFORK)
+        .BYTE     0, 1, 0, 0                     ; BICW
+        .BYTE     0, 0, 1, 1                     ; TSTW
+        .BYTE     0, 1                           ; BLSS
+        .BYTE     0, 1, 0, 0, 1                  ; BBS
+        .BYTE     0[4], 1                        ; BBS
+        .BYTE     0, 0, 0, 1, 1, 0               ; BBCC
+        .BYTE     0, 1, 1                        ; BSBW
+        .BYTE     0, 0, 1, 1                     ; CLRW
+        .BYTE     0, 0, 1, 1                     ; TSTW
+        .BYTE     0, 0                           ; BNEQ
+        .BYTE     0                              ; RSB
+        .BYTE     0, 0, 0, 1, 1, 0, 1, 1, 0      ; EXTZV
+        .BYTE     0, 0, 0, 1, 1                  ; TSTL
+        .BYTE     0, 0                           ; BLSS
+PU3_LOOK_MASK_E::
+
+PU3_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU3_HANDLER
+PU3_REPL_E:
+
+;;;
+;;; PU4 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine PU$SA_POLL
+;;; OpenVMS 7.3 location PUDRIVER + ^X3176
+;;;
+
+PU4_LOOK::
+        MOVL      CRB$L_AUXSTRUC(R3),R4
+        BSBW      PU4_LOOK
+        MOVL      ^XFA(R4),R5
+        MOVL      ^X266(R4),R0
+PU4_RCSR:
+        READ_CSR  @^XDA(R5), 188(R5), LENGTH=WORD
+PU4_RCSR_E:
+        BLSS      PU4_LOOK
+PU4_TRG:
+        EXTZV     #0,^X3FA(R4),^X28C(R4),R0
+        TSTL      ^X412(R4)[R0]
+PU4_TRG_E:
+        BLSS      PU4_LOOK
+PU4_LOOK_E::
+
+PU4_LOOK_MASK::
+        .BYTE     0[4]                           ; MOVL
+        .BYTE     0, 1, 1                        ; BSBW
+        .BYTE     0, 0, 1, 1, 0                  ; MOVL
+        .BYTE     0, 0, 1, 1, 0                  ; MOVL
+        READ_CSR_SA_UDASA_MASK                   ; READ_CSR
+        ASSUME    <PU4_RCSR_E - PU4_RCSR> EQ <RCSR_SA_UDASA_MASK_E - RCSR_SA_UDASA_MASK>
+        .BYTE     0, 1                           ; BLSS
+        .BYTE     0, 0, 0, 1, 1, 0, 1, 1, 0      ; EXTZV
+        .BYTE     0, 0, 0, 1, 1                  ; TSTL
+        .BYTE     0, 1                           ; BLSS
+PU4_LOOK_MASK_E::
+
+PU4_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU4_HANDLER
+PU4_REPL_E:
+
+;;;
+;;; PU5 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine POLL_CMDRING
+;;; OpenVMS 7.3 location PUDRIVER + ^X2CFC
+;;;
+
+        .ENABLE   LOCAL_BLOCK
+PU5_LOOK::
+1$:     TSTB      ^X38C(R4)
+        BEQL      20$
+PU5_TRG:
+        EXTZV     #0,^X4FA(R4),^X38A(R4),R2
+        TSTL      @^X4CA(R4)[R2]
+PU5_TRG_E:
+        BLSS      20$
+        MOVL      ^X39A(R4)[R2],R2
+        PUSHL     R2
+        INCB      ^X38A(R4)
+        DECB      ^X38C(R4)
+        REMQUE    @^X378(R4),R2
+        BVS       10$
+        BSBW      PU5_LOOK
+10$:
+        POPL      R2
+        BSBW      PU5_LOOK
+        BRB       1$
+20$:
+        MOVZWL    #SS$_NORMAL,R0
+        RSB
+PU5_LOOK_E::
+        .DISABLE  LOCAL_BLOCK
+
+PU5_LOOK_MASK::
+        .BYTE     0, 0, 1, 1                     ; TSTB
+        .BYTE     0, 0                           ; BEQL
+        .BYTE     0, 0, 0, 1, 1, 0, 1, 1, 0      ; EXTZV
+        .BYTE     0, 0, 0, 1, 1                  ; TSTL
+        .BYTE     0, 0                           ; BLSS
+        .BYTE     0, 0, 0, 1, 1, 0               ; MOVL
+        .BYTE     0, 0                           ; PUSHL
+        .BYTE     0, 0, 1, 1                     ; INCB
+        .BYTE     0, 0, 1, 1                     ; DECB
+        .BYTE     0, 0, 1, 1, 0                  ; REMQUE
+        .BYTE     0, 0                           ; BVS
+        .BYTE     0, 1, 1                        ; BSBW
+        .BYTE     0, 0, 0                        ; POPL
+        .BYTE     0, 1, 1                        ; BSBW
+        .BYTE     0, 0                           ; BRB
+        .BYTE     0, 0, 0                        ; MOVZWL
+        .BYTE     0                              ; RSB
+PU5_LOOK_MASK_E::
+
+PU5_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU5_HANDLER
+PU5_REPL_E:
+
+;;;
+;;; PU6 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine INSERT_IN_CRING (ENABLE_COMMAND_START)
+;;; OpenVMS 7.3 location PUDRIVER + ^X294B
+;;;
+
+PU6_LOOK::
+        EXTZV     #0,^X4FA(R4),^X38A(R4),R0
+        MOVL      R2,^X39A(R4)[R0]
+        MOVZBW    R0,^X6(R2)
+PU6_TRG:
+        MOVL      ^XE(R2),@^X4CA(R4)[R0]
+PU6_TRG_E:
+        MOVL      ^X368(R4),R1
+        PUSHL     R5
+        MOVL      ^XFA(R4),R5
+        BLBS      ^X386(R4),PU6_LOOK
+PU6_LOOK_E::
+
+PU6_LOOK_MASK::
+        .BYTE     0, 0, 0, 1, 1, 0, 1, 1, 0      ; EXTZV
+        .BYTE     0, 0, 0, 0, 1, 1               ; MOVL
+        .BYTE     0, 0, 0, 1                     ; MOVZBW
+        .BYTE     0, 0, 1, 0, 0, 1, 1            ; MOVL
+        .BYTE     0, 0, 1, 1, 0                  ; MOVL
+        .BYTE     0, 0                           ; PUSHL
+        .BYTE     0, 0, 1, 1, 0                  ; MOVL
+        .BYTE     0, 0, 1, 1, 1                  ; BLBS
+PU6_LOOK_MASK_E::
+
+PU6_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU6_HANDLER
+PU6_REPL_E:
+
+;;;
+;;; PU7 patch source template, located and matched in loaded PUDRIVER
+;;; Module [DRIVER.SRC]PUDRIVER.MAR, routine CRING_FULL
+;;; OpenVMS 7.3 location PUDRIVER + ^X29DA
+;;;
+
+PU7_LOOK::
+        INSQUE    (R2),@^X37A(R4)
+        BSBW      PU7_LOOK
+        MOVZWL    #SS$_NORMAL,R0
+        RSB
+        BSBW      PU7_LOOK
+PU7_TRG:
+        MOVL      ^XA(R2),@^X4CA(R4)[R0]
+PU7_TRG_E:
+        BRW       PU7_LOOK
+PU7_LOOK_E::
+
+PU7_LOOK_MASK::
+        .BYTE     0, 0, 0, 1, 1                  ; INSQUE
+        .BYTE     0, 1, 1                        ; BSBW
+        .BYTE     0, 0, 0                        ; MOVZWL
+        .BYTE     0                              ; RSB
+        .BYTE     0, 1, 1                        ; BSBW
+        .BYTE     0, 0, 1, 0, 0, 1, 1            ; MOVL
+        .BYTE     0, 1, 1                        ; BRW
+PU7_LOOK_MASK_E::
+
+PU7_REPL:
+        JSB       @#^X80001234                   ; will be JSB @#PU7_HANDLER
+PU7_REPL_E:
+
+;;;
+;;; General instruction templates
+;;;
+
+JMP_INSTR:
+        JMP       @#^X80001234                   ; JMP G^xxx instruction template
+JSB_INSTR:
+        JSB       @#^X80001234                   ; JSB G^xxx instruction template
+
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- code
+;;***********************************************************************************
+
+        .PSECT    KLOAD_CODE QUAD, PIC, EXE, SHR, NOWRT
+;+
+;
+;  Check if dynamic patches can be applied.
+;
+;  Inputs:
+;      4(AP) = nopatch mask
+;      IPL = 31
+;
+;  Outputs:
+;      Status in R0.
+;
+;-
+        ARG_NOPATCH = 4
+;
+        .ENTRY    CHECK_DYNPATCHES, ^M<R2,R3,R7>
+        .ENABLE   LOCAL_BLOCK
+        MOVAB     PATCHDESC_LIST, R7               ; get patch list start address
+10$:
+        MOVZBL    PATCH_DESC_ID(R7), R0            ; get patch id
+        CMPL      R0, #PATCH_ID_END_OF_LIST        ; end of list?
+        BEQL      120$                             ; eql - reached end, finish
+        BBS       R0, ARG_NOPATCH(AP), 100$        ; is this patch disabled?
+        TSTL      PATCH_DESC_LOOKUP_FOUND(R7)      ; was this patch located?
+        BEQL      150$                             ; eql - no
+        ;
+        ;  verify located patch matches "trg"
+        ;
+        BBS       #PD_V_NOVERIFY, -                ; skip if complex pattern
+                  PATCH_DESC_FLAGS(R7), 100$       ; ...
+        ADDL3     R7, PATCH_DESC_TRG_BEGIN(R7), R0 ; trg start
+        ADDL3     R7, PATCH_DESC_TRG_END(R7), R1   ; trg length
+        SUBL      R0, R1                           ; ...
+        MOVL      PATCH_DESC_LOOKUP_FOUND(R7), R2  ; located patch pointer to "lookup"
+        ADDL      PATCH_DESC_TRG_BEGIN(R7), R2     ; advance from "lookup" to "trg"
+        SUBL      PATCH_DESC_LOOKUP_BEGIN(R7), R2  ; ...
+        CMPC3     R1, (R0), (R2)                   ; compare pattern with located data
+        BNEQ      150$                             ; neq - mismatch
+100$:
+        ADDL      #PATCH_DESC_SIZE, R7             ; go check next patch in the list
+        BRB       10$                              ; ...
+120$:
+        MOVZBL    #SS$_NORMAL, R0                  ; all list had been processed
+        RET                                        ; return success status to caller
+150$:
+        MOVL      PATCH_DESC_ERROR_STATUS(R7), R0  ; return error status
+        RET                                        ; to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Apply dynamic patches.
+;
+;  Inputs:
+;      4(AP) = nopatch mask
+;      IPL = 31
+;      Uniprocessor environment
+;
+;  Outputs:
+;      Patches applied.
+;
+;-
+        ARG_NOPATCH = 4
+;
+        .ENTRY    APPLY_DYNPATCHES, ^M<R2,R3,R4,R5,R6,R7,R8,R9>
+        .ENABLE   LOCAL_BLOCK
+        ;
+        ;  fixup replacing patch code
+        ;
+        MOVAB     CHSEP_HANDLER, -                 ; fix JSB instruction
+                  CHSEP_REPL + 2                   ; ...
+        MOVAB     RESCHED_HANDLER, -               ; fix JSB instruction
+                  RESCHED_REPL + 2                 ; ...
+        MOVAB     NUMTIM_HANDLER, -                ; fix JSB instruction
+                  NUMTIM_REPL + 2                  ; ...
+        MOVAB     MFYCAP_HANDLER, -                ; fix JSB instruction
+                  MFYCAP_REPL + 2                  ; ...
+        MOVAB     UCBTMO_HANDLER, -                ; fix JSB instruction
+                  UCBTMO_REPL + 2                  ; ...
+        MOVAB     CRBTMO_HANDLER, -                ; fix JSB instruction
+                  CRBTMO_REPL + 2                  ; ...
+        MOVAB     XQTX123_HANDLER, -               ; fix JSB instruction
+                  XQTX1_REPL + 2                   ; ...
+        MOVAB     XQTX4_HANDLER, -                 ; fix JSB instruction
+                  XQTX4_REPL + 2                   ; ...
+        MOVAB     XQTX5_HANDLER, -                 ; fix JSB instruction
+                  XQTX5_REPL + 2                   ; ...
+        MOVAB     XQTX6_HANDLER, -                 ; fix JSB instruction
+                  XQTX6_REPL + 2                   ; ...
+        MOVAB     XQTX7_HANDLER, -                 ; fix JSB instruction
+                  XQTX7_REPL + 2                   ; ...
+        MOVAB     XQTX8_HANDLER, -                 ; fix JSB instruction
+                  XQTX8_REPL + 2                   ; ...
+        MOVAB     XQTX9_HANDLER, -                 ; fix JSB instruction
+                  XQTX9_REPL + 2                   ; ...
+        MOVAB     XQTX10_HANDLER, -                ; fix JSB instruction
+                  XQTX10_REPL + 2                  ; ...
+        MOVAB     XQRX1_HANDLER, -                 ; fix JSB instruction
+                  XQRX1_REPL + 2                   ; ...
+        MOVAB     XQRX2_HANDLER, -                 ; fix JSB instruction
+                  XQRX2_REPL + 2                   ; ...
+        MOVAB     XQRX3_HANDLER, -                 ; fix JSB instruction
+                  XQRX3_REPL + 2                   ; ...
+        MOVAB     XQRX4_HANDLER, -                 ; fix JSB instruction
+                  XQRX4_REPL + 2                   ; ...
+        MOVAB     PU1_HANDLER, -                   ; fix JSB instruction
+                  PU1_REPL + 2                     ; ...
+        MOVAB     PU2_HANDLER, -                   ; fix JSB instruction
+                  PU2_REPL + 2                     ; ...
+        MOVAB     PU3_HANDLER, -                   ; fix JSB instruction
+                  PU3_REPL + 2                     ; ...
+        MOVAB     PU4_HANDLER, -                   ; fix JSB instruction
+                  PU4_REPL + 2                     ; ...
+        MOVAB     PU5_HANDLER, -                   ; fix JSB instruction
+                  PU5_REPL + 2                     ; ...
+        MOVAB     PU6_HANDLER, -                   ; fix JSB instruction
+                  PU6_REPL + 2                     ; ...
+        MOVAB     PU7_HANDLER, -                   ; fix JSB instruction
+                  PU7_REPL + 2                     ; ...
+        ;
+        ;  process patch list
+        ;
+        MOVAB     PATCHDESC_LIST, R7               ; patch list start address
+10$:
+        MOVZBL    PATCH_DESC_ID(R7), R0            ; get patch id
+        CMPL      R0, #PATCH_ID_END_OF_LIST        ; end of list?
+        XBEQL     120$                             ; eql - reached the end, finish
+        XBBS      R0, ARG_NOPATCH(AP), 100$        ; is this patch disabled?
+        XBBS      #PD_V_NOAPPLY, -                 ; descriptor marked "noapply"?
+                  PATCH_DESC_FLAGS(R7), 100$       ; bs - skip it  
+        ;
+        ;  R4 = replacement code address
+        ;  R6 = replacement code size
+        ;  R8 = target code first VA (VA1)
+        ;  R9 = target code last VA (VA2), including both target-replacement and target-fill areas
+        ;                                  and pointing to the last byte of target-fill area if any,
+        ;                                  otherwise last byte of target-replacement area
+        ;
+        ADDL3     R7, PATCH_DESC_REPL_BEGIN(R7), R4    ; replacement begin address
+        ADDL3     R7, PATCH_DESC_REPL_END(R7), R6      ; replacement end address
+        SUBL      R4, R6                               ; replacement size
+        MOVL      PATCH_DESC_LOOKUP_FOUND(R7), R8      ; target base address
+        ADDL      PATCH_DESC_TRG_BEGIN(R7), R8         ; ...
+        SUBL      PATCH_DESC_LOOKUP_BEGIN(R7), R8      ; ...
+        MOVL      PATCH_DESC_LOOKUP_FOUND(R7), R9      ; target end address
+        ADDL      PATCH_DESC_TRG_END(R7), R9           ; ...
+        SUBL      PATCH_DESC_LOOKUP_BEGIN(R7), R9      ; ...
+        DECL      R9                                   ; inclusive only
+        ;
+        ;  save code page PTEs for VA1 and VA2
+        ;  (note that it can be the same page)
+        ;
+        MOVL      G^LDR$GL_SPTBASE, R1             ; get SPT base
+        EXTZV     #VA$V_VPG, #VA$S_SVPN, R8, R0    ; extract VA1 SVPN
+        MOVL      (R1)[R0], SV_PTE1                ; save VA1 SPTE
+        EXTZV     #VA$V_VPG, #VA$S_SVPN, R9, R0    ; extract VA2 SVPN
+        MOVL      (R1)[R0], SV_PTE2                ; save VA2 SPTE
+        ;
+        ;  change PTEs and invalidate TLB entries
+        ;
+        EXTZV     #VA$V_VPG, #VA$S_SVPN, R8, R0    ; extract VA1 SVPN
+        MOVAL     (R1)[R0], R0                     ; address of VA1 SPTE
+        INSV      #<PTE$C_URKW@<-PTE$V_PROT>>, -   ; set PTE protection = URKW
+                  #PTE$V_PROT, #PTE$S_PROT, (R0)   ; ...
+        MTPR      R8, S^#PR$_TBIS                  ; invalidate TLB
+        ;
+        EXTZV     #VA$V_VPG, #VA$S_SVPN, R9, R0    ; extract VA2 SVPN
+        MOVAL     (R1)[R0], R0                     ; address of VA2 SPTE
+        INSV      #<PTE$C_URKW@<-PTE$V_PROT>>, -   ; set PTE protection = URKW
+                  #PTE$V_PROT, #PTE$S_PROT, (R0)   ; ...
+        MTPR      R9, S^#PR$_TBIS                  ; invalidate TLB
+        ;
+        ;  copy patch
+        ;
+        MOVC3     R6, (R4), (R8)                   ; copy patch code to target area
+        ;
+        ;  fill remaining area (if its size > 0) with NOPs or HALTs or BPTs
+        ;
+        SUBL3     PATCH_DESC_TRG_BEGIN(R7), -      ; calculate "trg" length 
+                  PATCH_DESC_TRG_END(R7), R0       ; ...
+        SUBL      R6, R0                           ; excess over "repl"
+        BLEQ      30$                              ; leq - do not pad
+        ADDL3     R6, R8, R1                       ; padding start address
+        MOVB      #OP$_NOP, R2                     ; select the filler
+        BBS       #PD_V_FILL_NOP, -                ; ...
+                  PATCH_DESC_FLAGS(R7), 20$        ; ...
+        MOVB      #OP$_HALT, R2                    ; ...
+        BBS       #PD_V_FILL_HALT, -               ; ...
+                  PATCH_DESC_FLAGS(R7), 20$        ; ...
+        MOVB      #OP$_BPT, R2                     ; ...
+20$:        
+        MOVC5     #0, (SP), R2, R0, (R1)           ; do pad filling
+30$:
+        ;
+        ;  restore PTEs
+        ;
+        MOVL      G^LDR$GL_SPTBASE, R1             ; restore SPTE for VA1
+        EXTZV     #VA$V_VPG, #VA$S_SVPN, R8, R0    ; ...
+        MOVL      SV_PTE1, (R1)[R0]                ; ...
+        MTPR      R8, S^#PR$_TBIS                  ; invalidate TLB
+        ;
+        EXTZV     #VA$V_VPG, #VA$S_SVPN, R9, R0    ; restore SPTE for VA2
+        MOVL      SV_PTE2, (R1)[R0]                ; ...
+        MTPR      R9, S^#PR$_TBIS                  ; invalidate TLB
+100$:
+        ADDL      #PATCH_DESC_SIZE, R7             ; go process next patch
+        BRW       10$                              ; ...
+120$:
+        RET                                        ; reached the end, return
+        .DISABLE  LOCAL_BLOCK
+
+
+;+
+;
+;  Store address of patch pattern.
+;
+;      bool_t set_patchdesc_lookup_found(uint32 patch_id, void* addr);
+;
+;-
+        ARG_PATCH_ID = 4
+        ARG_ADDR = 8
+;
+        .ENTRY    SET_PATCHDESC_LOOKUP_FOUND, ^M<R7>
+        .ENABLE   LOCAL_BLOCK
+        MOVAB     PATCHDESC_LIST, R7               ; get patch list start address
+10$:
+        MOVZBL    PATCH_DESC_ID(R7), R0            ; get patch id
+        CMPL      R0, ARG_PATCH_ID(AP)             ; matches?
+        BEQL      20$                              ; eql - go store
+        CMPL      R0, #PATCH_ID_END_OF_LIST        ; end of list?
+        BEQL      100$                             ; eql - reached end, finish
+        ADDL      #PATCH_DESC_SIZE, R7             ; go check next patch in the list
+        BRB       10$                              ; ...
+20$:
+        MOVL      ARG_ADDR(AP), -                  ; save found location to patch table
+                  PATCH_DESC_LOOKUP_FOUND(R7)      ; ...
+        MOVZBL    #1, R0                           ; return success status
+        RET                                        ; to the caller
+100$:
+        CLRL      R0                               ; return failure status
+        RET                                        ; to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;;***********************************************************************************
+;;  Handler for CHSEP patch (fixes SCH$CHSEP)
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+CHSEP_HANDLER:
+        ;
+        ;  if idle sleep is disabled, use standard VMS algorithm
+        ;
+        ;  R5 = PCB$L_CURRENT_AFFINITY(R4)
+        ;
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_ON        ; is idle sleep enabled?
+        BNEQ      70$                              ; neq - go use standard VMS algorithm
+        ;
+        ;  use VSMP specific algorithm - signal only one eligible CPU
+        ;
+        BBC       #CPB$V_IMPLICIT_AFFINITY, -      ; is implicit affinity involved?
+                  PCB$L_CAPABILITY(R4), 10$        ; bc - no
+        BBSC      PCB$L_AFFINITY(R4), -            ; yes, see if CPU is idle
+                  G^SCH$GL_IDLE_CPUS, 100$         ; bs - signal the CPU
+10$:
+        PUSHL     R0                               ; preserve working register
+        ANDL3     R5, G^SCH$GL_IDLE_CPUS, R0       ; get mask of eligible *and* idle CPUs
+        FFS       #0, #32, R0, R0                  ; find first CPU ID in the mask
+        BEQL      20$                              ; eql - should never happen
+        ASHL      R0, #1, R0                       ; convert to mask
+        BICL      R0, G^SCH$GL_IDLE_CPUS           ; signal one eligible CPUs
+        POPL      R0                               ; restore saved register
+        RSB                                        ; rejoin SCH$CHSEP
+20$:   
+        POPL      R0                               ; restore saved register
+        BRB       80$                              ; use old algorithm
+        ;
+        ;  VMS standard algorithm - signal all eligible CPUs
+        ;
+70$:
+        BBC       #CPB$V_IMPLICIT_AFFINITY, -      ; is implicit affinity involved?
+                  PCB$L_CAPABILITY(R4), 80$        ; bc - no
+        BBSC      PCB$L_AFFINITY(R4), -            ; yes, see if CPU is idle
+                  G^SCH$GL_IDLE_CPUS, 100$         ; bs - signal the CPU
+80$:    BICL      R5, G^SCH$GL_IDLE_CPUS           ; signal all eligible CPUs
+100$:   RSB                                        ; rejoin SCH$CHSEP
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for RESCHED patch (fixes SCH$RESCHED)
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+RESCHED_HANDLER:
+        ;
+        ;  if idle sleep is disabled, use standard VMS algorithm
+        ;
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_ON        ; is idle sleep enabled?
+        BNEQ      300$                             ; neq - go use standard VMS algorithm
+        ;
+        ;  use VSMP specific algorithm - signal only one eligible CPU
+        ;
+        PUSHL     R0                               ; save working register
+        MOVL      PCB$L_CURRENT_AFFINITY(R1), R0   ; get affinity of the descheduled process
+        BITL      R0, G^SCH$GL_IDLE_CPUS           ; any idle CPUs good for it?
+        BEQL      290$                             ; eql - none, go use standard VMS code
+        BBS       #CPB$V_IMPLICIT_AFFINITY, -      ; is implicit affinity involved?
+                  PCB$L_CAPABILITY(R1), 100$       ; bs - yes
+10$:
+        ANDL3     PCB$L_CURRENT_AFFINITY(R1), -    ; get mask of eligible *and* idle CPUs
+                  G^SCH$GL_IDLE_CPUS, R0           ; ...
+        FFS       #0, #32, R0, R0                  ; find first CPU ID in the mask
+        BEQL      290$                             ; eql - should never happen
+        ASHL      R0, #1, R0                       ; convert to mask
+        BICL      R0, G^SCH$GL_IDLE_CPUS           ; signal to the CPU
+        BICL      R0, G^VBSS$GL_STALLED_CPUS       ; remove it from the stalled mask
+20$:
+        BICL      #VBS$M_SKP_VBS, G^VBSS$GL_FLAGS  ; enable VBS scheduling
+        POPL      R0                               ; restore working register
+        RSB                                        ; rejoin SCH$RESCHED
+100$:
+        BBSC      PCB$L_AFFINITY(R1), -            ; signal CPU if available
+                  G^SCH$GL_IDLE_CPUS, 110$         ; bs - was available
+        BRB       10$                              ; else go signal first eligible
+110$:
+        BBCC      PCB$L_AFFINITY(R1), -            ; remove signalled CPU from 
+                  G^VBSS$GL_STALLED_CPUS, 20$      ; the stalled CPUs set
+        BRB       20$                              ; join common exit
+        ;
+        ;  rejoin VMS standard algorithm
+        ;
+290$:   POPL      R0                               ; restore working register
+        ;
+        ;  VMS standard algorithm - signal all CPUs
+        ;
+300$:
+        CLRL      G^SCH$GL_IDLE_CPUS               ; signal all CPUs
+        CLRL      G^VBSS$GL_STALLED_CPUS           ; no stalled CPUs
+        BICL      #VBS$M_SKP_VBS, G^VBSS$GL_FLAGS  ; enable VBS scheduling
+        RSB                                        ; rejoin SCH$RESCHED
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for NUMTIM patch (fixes EXE$NUMTIM)
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+NUMTIM_HANDLER:
+        PUSHL     R0                               ; save scratch register
+        CLRQ      -(SP)                            ; allocate buffer for time on stack
+        PUSHL     SP                               ; build arglist for CMKRNL
+        PUSHL     #1                               ; ...
+        MOVL      SP, R0                           ; address of arglist
+        $CMKRNL_S ROUTIN=NUMTIM_K, ARGLST=(R0)     ; call to get time
+        BLBC      R0, 100$                         ; lbc - unexpected, failed to switch to kernel,
+                                                   ; go use old code
+        ADDL      #8, SP                           ; remove arglist off the stack
+        MOVQ      (SP)+, R1                        ; move time to R1, R2
+        POPL      R0                               ; restore scratch register
+        RSB                                        ; rejoin EXE$NUMTIM
+        ;
+        ;  comes here if failed to switch to kernel mode
+        ;  (should never happen, since we are in exec mode)
+        ;
+100$:   
+        ADDL      #16, SP                          ; remove arglist and time buffer off the stack
+        POPL      R0                               ; restore scratch register
+        ;
+        ;  read system time the original NUMTIM (bad) way
+        ;
+105$:
+        MOVQ      G^EXE$GQ_SYSTIME, R1             ; read SYSTIME
+        CMPL      G^EXE$GQ_SYSTIME, R1             ; re-read if had changed
+        BNEQ      105$                             ; ...
+        CMPL      G^EXE$GQ_SYSTIME+4, R2           ; ...
+        BNEQ      105$                             ; ...
+        RSB                                        ; rejoin EXE$NUMTIM
+
+        .ENTRY    NUMTIM_K, ^M<>
+        READ_SYSTIME  @4(AP)                       ; read time the proper way
+        MOVZBL    #SS$_NORMAL, R0                  ; return success status
+        RET                                        ; to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for MFYCAP patch (fixes SCH$ADD_CPU_CAP/SCH$REMOVE_CPU_CAP)
+;;***********************************************************************************
+
+MFYCAP_HANDLER:
+        MEMBAR
+        CLRL      G^SCH$GL_IDLE_CPUS
+        UNLOCK    MUTEX=SMP$GL_CPU_MUTEX, PRESERVE=YES, SHARE=YES
+        RSB
+
+;;***********************************************************************************
+;;  Handler for UCBTMO patch (currently a placeholder)
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+UCBTMO_HANDLER:
+        CMPL      UCB$L_DUETIM(R5), G^EXE$GL_ABSTIM
+        RSB
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for CRBTMO patch (currently a placeholder)
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+CRBTMO_HANDLER:
+        CMPL      CRB$L_DUETIME-CRB$L_TIMELINK(R6), G^EXE$GL_ABSTIM
+        RSB
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patches XQTX1, XQTX2, XQTX3
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+XQTX123_HANDLER:
+        MOVW      QNA_XMT$W_STS(R6), R2
+        EXTZV     #QNA_XMT$V_STS_ERR, #2, R2, R2
+        MEMBAR
+        RSB
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for XQTX4 patch
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+XQTX4_HANDLER:
+        PUSHL     R0
+        MOVW      QNA_XMT$W_STS(R6), R0
+        MEMBAR
+        BBC       #QNA_XMT$V_STS_LAST, R0, 10$
+        BBS       #QNA_XMT$V_STS_ERR, R0, 10$
+        POPL      R0
+        RSB
+10$:
+        POPL      R0
+        ADDL      #4, SP
+XQTX4_HANDLER_JMP::
+        JMP       @#^X80001234
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handlers for patches XQTX5, XQTX6, XQTX7, XQTX8, XQTX9, XQTX10
+;;***********************************************************************************
+
+XQTX5_HANDLER:
+        BICW      #<QNA_XMT$M_DSC_CHAIN!QNA_XMT$M_DSC_VALID>, QNA_XMT$W_ADDRHI(R1)
+        MEMBAR
+        RSB
+
+XQTX6_HANDLER:
+        BISW      #<QNA_XMT$M_DSC_VALID!QNA_XMT$M_DSC_EOM>, R8
+        MEMBAR
+        MOVW      R8, QNA_XMT$W_ADDRHI(R6)
+        RSB
+
+XQTX7_HANDLER:
+        BICW      #QNA_XMT$M_DSC_VALID, QNA_XMT$W_ADDRHI(R5)
+        MEMBAR
+        RSB
+
+XQTX8_HANDLER:
+        BICW      #QNA_XMT$M_DSC_VALID, QNA_XMT$W_ADDRHI(R6)
+        MEMBAR
+        RSB
+
+        .ENABLE   LOCAL_BLOCK
+XQTX9_HANDLER:
+XQTX9_HANDLER_MOVL::
+        .BYTE     OP$_BPT[9]                     ; space for MOVL instruction
+        BBSC      #QNA_XMT$V_DSC_SETUP, QNA_XMT$W_ADDRHI(R6), 10$
+        MEMBAR                                   ; really redundant since bit was not changed, but just to be safe...
+        RSB
+10$:
+        MEMBAR
+        ADDL      #4, SP
+XQTX9_HANDLER_JMP::
+        JMP       @#80001234                     ; jump address will be set
+        .DISABLE  LOCAL_BLOCK
+
+XQTX10_HANDLER:
+        PUSHL     (SP)
+        DEVICELOCK  LOCKADDR=UCB$L_DLCK(R5), -
+                  SAVIPL=-(SP), -
+                  PRESERVE=NO
+        MOVL      (SP), 8(SP)
+        ADDL      #4, SP
+        MEMBAR                                   ; really redundant after DEVICELOCK
+        MOVW      R8, QNA_XMT$W_ADDRHI(R6)
+        MEMBAR                                   ; probably unneeded, but just to be safe
+        RSB
+
+;;***********************************************************************************
+;;  Handler for XQRX1 patch
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+XQRX1_HANDLER:
+        PUSHL     R0
+        MOVW      QNA_RCV$W_STS(R6), R0
+        MEMBAR
+        BBC       #QNA_RCV$V_STS_LAST, R0, 20$
+        BBC       #QNA_RCV$V_STS_ERR, R0, 50$
+20$:    
+        POPL      R0
+        CMPB      QNA_RCV$W_LENB(R6), QNA_RCV$W_LENB+1(R6)
+        RSB
+50$:
+        POPL      R0
+        TSTB      #1
+        RSB
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patches XQRX2, XQRX3 and XQRX4
+;;***********************************************************************************
+
+XQRX2_HANDLER:
+        BICW      #<QNA_RCV$M_DSC_CHAIN!QNA_RCV$M_DSC_VALID>, QNA_RCV$W_ADDRHI(R1)
+        MEMBAR
+        RSB
+
+XQRX3_HANDLER:
+        MEMBAR
+        BISW      #QNA_RCV$M_DSC_VALID, QNA_RCV$W_ADDRHI(R6)
+        RSB
+
+        .ENABLE   LOCAL_BLOCK
+XQRX4_HANDLER:
+XQRX4_HANDLER_BICB::
+        .BYTE     OP$_BPT[7]                     ; space for BICB instruction
+        BBCC      #QNA_RCV$V_DSC_VALID, QNA_RCV$W_ADDRHI(R6), 10$
+10$:
+        MEMBAR
+        RSB
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Apply XQTIMXMT patch to XQDRIVER code
+;
+;      void patch_xqdrv_instr(void* addr_mov_xmt_tmo, uint32 xqtimeout);
+;
+;-
+        ARG_ADDR_MOV_XMT_TMO = 4
+        ARG_XQTIMEOUT = 8
+;
+        .ENTRY    PATCH_XQDRV_INSTR, ^M<>
+        MOVL      ARG_XQTIMEOUT(AP), -           ; store timeout
+                  XQ_XMT_TIMEOUT                 ; ...
+        MOVL      ARG_ADDR_MOV_XMT_TMO(AP), R0   ;
+        MOVW      3(R0), XQPATCH_INS_1 + 7       ; copy target offset in MOVB #QNA$C_XMT_TMO, LSB$G_QNA_TIMXMT+1(R4)
+        MOVL      5(R0), XQPATCH_INS_2           ; copy second instruction (7 bytes long)
+        MOVW      <5 + 4>(R0), XQPATCH_INS_2 + 4 ; i.e. MOVW #QNA$C_SID_MINTIM, LSB$G_QNA_TIMSID+2(R4)
+        MOVB      <5 + 6>(R0), XQPATCH_INS_2 + 6 ; ...
+        DSBINT    #IPL$_POWER, -(SP), -          ; block interrupts while we are patching XQDRIVER code
+                  ENVIRON=UNIPROCESSOR           ; ...
+        MOVW      JSB_INSTR, (R0)                ; replace XQDRIVER's two instructions with
+        MOVAB     XQPATCH_INS_1, 2(R0)           ; JSB @#XQPATCH_INS_1
+        MOVL      #^X01010101, 6(R0)             ; and NOPs
+        MOVW      #^X0101, 10(R0)                ; ...
+        JSB       FLUSH_INSTRUCTION_STREAM       ; flush instructon stream after patching the code
+        ENBINT    (SP)+                          ; restore IPL
+        RET                                      ; return to the caller
+        ;
+        ;  XQDRIVER's SUB_START_CTRL_TIMER will jump here
+        ;
+XQPATCH_INS_1:
+        MOVB      L^XQ_XMT_TIMEOUT, W^1024(R4)
+XQPATCH_INS_2:
+        .BLKB     7
+        RSB
+
+
+;;***********************************************************************************
+;;  Handler for patch PU1
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+        ;
+        ;  note that preceeding READ_CSR in PUDRIVER code just provided memory barrier
+        ;
+PU1_HANDLER:
+10$:
+        .BLKB     5                              ; SETUP_PATCH_PU1 will copy MOVL PDT$W_CMDINT(R4),R0 into here
+        BEQL      20$
+        MEMBAR
+        RSB
+20$:
+        ADDL      #4, SP
+30$:
+        JMP       @#^XFFFFFFFF                   ; SETUP_PATCH_PU1 will store actual destination in here
+
+        .ENTRY    SETUP_PATCH_PU1, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU1_LOOK
+        ASSUME    <PU1_LOOK_BEQL - PU1_TRG> EQ 5
+        MOVL      <PU1_TRG - PU1_LOOK>(R2), 10$             ; copy instruction MOVL PDT$W_CMDINT(R4),R0
+        MOVB      <PU1_TRG - PU1_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVAB     <PU1_LOOK_BEQL - PU1_LOOK>(R2), R0        ; address of BEQL instruction
+        CVTBL     1(R0), R1                                 ; calculate target address of BEQL
+        ADDL      R0, R1                                    ; ...
+        ADDL      #2, R1                                    ; ...
+        MOVL      R1, 30$ + 2                               ; store it in PU1_HANDLER code
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patch PU2
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+PU2_HANDLER:
+        MEMBAR
+10$:
+        .BLKB     7                                         ; space for MOVL UDAB$L_DESCRIP(R2),PDT$L_RSPRING(R4)[R0]
+        ;
+        ;  note that ADAWI executed right after RSB will also provide a memory barrier
+        ;
+        RSB
+
+        .ENTRY    SETUP_PATCH_PU2, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU2_LOOK
+        ASSUME    <PU2_TRG_E - PU2_TRG> EQ 7
+        MOVL      <PU2_TRG - PU2_LOOK>(R2), 10$             ; copy instruction MOVL UDAB$L_DESCRIP(R2),PDT$L_RSPRING(R4)[R0]
+        MOVW      <PU2_TRG - PU2_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVB      <PU2_TRG - PU2_LOOK + 6>(R2), 10$ + 6     ; ...
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patch PU3
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+PU3_HANDLER:
+        ;
+        ;  SETUP_PATCH_PU3 will copy in the space below instructions
+        ;      EXTZV  #0,PDT$B_RINGEXP(R4),PDT$B_RPOLLINX(R4),R0
+        ;      TSTL   PDT$L_RSPRING(R4)[R0]
+        ;
+10$:    .BLKB     14                                        ; space for EXTZV and TSTL
+        BLSS      20$                                       ; LSS - return LSS
+        MEMBAR                                              ; execute memory barrier
+        TSTB      #0                                        ; return GEQ
+20$:
+        RSB                                                 ; return to the caller
+
+        .ENTRY    SETUP_PATCH_PU3, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU3_LOOK
+        ASSUME    <PU3_TRG_E - PU3_TRG> EQ 14
+        MOVL      <PU3_TRG - PU3_LOOK>(R2), 10$             ; copy instructions EXTZV and TSTL (9 + 5 = 14 bytes)
+        MOVL      <PU3_TRG - PU3_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVL      <PU3_TRG - PU3_LOOK + 8>(R2), 10$ + 8     ; ...
+        MOVW      <PU3_TRG - PU3_LOOK + 12>(R2), 10$ + 12   ; ...
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patch PU4
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+PU4_HANDLER:
+        ;
+        ;  SETUP_PATCH_PU4 will copy in the space below instructions
+        ;      EXTZV  #0,PDT$B_RINGEXP(R4),PDT$B_RPOLLINX(R4),R0
+        ;      TSTL   PDT$L_RSPRING(R4)[R0]
+        ;
+10$:    .BLKB     14                                        ; space for EXTZV and TSTL
+        BLSS      20$                                       ; LSS - return LSS
+        MEMBAR                                              ; execute memory barrier
+        TSTB      #0                                        ; return GEQ
+20$:
+        RSB                                                 ; return to the caller
+
+        .ENTRY    SETUP_PATCH_PU4, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU4_LOOK
+        ASSUME    <PU4_TRG_E - PU4_TRG> EQ 14
+        MOVL      <PU4_TRG - PU4_LOOK>(R2), 10$             ; copy instructions EXTZV and TSTL (9 + 5 = 14 bytes)
+        MOVL      <PU4_TRG - PU4_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVL      <PU4_TRG - PU4_LOOK + 8>(R2), 10$ + 8     ; ...
+        MOVW      <PU4_TRG - PU4_LOOK + 12>(R2), 10$ + 12   ; ...
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patch PU5
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+PU5_HANDLER:
+        ;
+        ;  SETUP_PATCH_PU5 will copy in the space below instructions
+        ;      EXTZV   #0,PDT$B_RINGEXP(R4),PDT$B_CPOLLINX(R4),R2
+        ;      TSTL    @PDT$L_CMDRING(R4)[R2]
+        ;
+10$:    .BLKB     14                                        ; space for EXTZV and TSTL
+        BLSS      20$                                       ; LSS - return LSS
+        MEMBAR                                              ; execute memory barrier
+        TSTB      #0                                        ; return GEQ
+20$:
+        RSB                                                 ; return to the caller
+
+        .ENTRY    SETUP_PATCH_PU5, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU5_LOOK
+        ASSUME    <PU5_TRG_E - PU5_TRG> EQ 14
+        MOVL      <PU5_TRG - PU5_LOOK>(R2), 10$             ; copy instructions EXTZV and TSTL (9 + 5 = 14 bytes)
+        MOVL      <PU5_TRG - PU5_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVL      <PU5_TRG - PU5_LOOK + 8>(R2), 10$ + 8     ; ...
+        MOVW      <PU5_TRG - PU5_LOOK + 12>(R2), 10$ + 12   ; ...
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patch PU6
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+PU6_HANDLER:
+        MEMBAR
+        ;
+        ;  SETUP_PATCH_PU6 will copy in the space below instruction
+        ;      MOVL UDAB$L_DESCRIP(R2),@PDT$L_CMDRING(R4)[R0]
+        ;
+10$:    .BLKB     7                                         ; space for MOVL
+        RSB                                                 ; return to the caller
+        ; note that subsequent memory barrier will also be performed by READ_CSR right after returning
+
+        .ENTRY    SETUP_PATCH_PU6, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU6_LOOK
+        ASSUME    <PU6_TRG_E - PU6_TRG> EQ 7
+        MOVL      <PU6_TRG - PU6_LOOK>(R2), 10$             ; copy MOVL instruction
+        MOVW      <PU6_TRG - PU6_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVB      <PU6_TRG - PU6_LOOK + 6>(R2), 10$ + 6     ; ...
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Handler for patch PU7
+;;***********************************************************************************
+
+        .ENABLE   LOCAL_BLOCK
+PU7_HANDLER:
+        MEMBAR
+        ;
+        ;  SETUP_PATCH_PU7 will copy in the space below instruction
+        ;      MOVL UDAB$L_DESCRIP(R2),@PDT$L_CMDRING(R4)[R0]
+        ;
+10$:    .BLKB     7                                         ; space for MOVL
+        RSB                                                 ; return to the caller
+        ; note that subsequent memory barrier will also be performed by READ_CSR right after returning
+
+        .ENTRY    SETUP_PATCH_PU7, ^M<R2>
+        MOVL      4(AP), R2                                 ; address of the area in PUDRIVER matching PU7_LOOK
+        ASSUME    <PU7_TRG_E - PU7_TRG> EQ 7
+        MOVL      <PU7_TRG - PU7_LOOK>(R2), 10$             ; copy MOVL instruction
+        MOVW      <PU7_TRG - PU7_LOOK + 4>(R2), 10$ + 4     ; ...
+        MOVB      <PU7_TRG - PU7_LOOK + 6>(R2), 10$ + 6     ; ...
+        RET                                                 ; return (void) to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;;***********************************************************************************
+;;  Utility routines to assist loader, not relocated into the resident image
+;;***********************************************************************************
+
+        .PSECT    $CODE LONG, SHR, NOWRT, PIC, EXE
+;+
+;
+;  Lock/unlock required system pages in memory (system working set).
+;  Used to lock pageable executive pages that need to be patched.
+;
+;      void k_lock_system_pages(uint32 nopatch);
+;      void k_unlock_system_pages(uint32 nopatch);
+;
+;  Pages should be locked before patching.
+;  They can be unlocked only if patching had not been applied.
+;
+;-
+        ARG_NOPATCH = 4
+;
+        .ENTRY    K_LOCK_SYSTEM_PAGES, ^M<R7>
+        .ENABLE   LOCAL_BLOCK
+        BBS       #PATCH_ID_NUMTIM, -              ; bs - skip NUMTIM patch
+                  ARG_NOPATCH(AP), 10$             ; ...
+        MOVAB     PATCHDESC_NUMTIM, R7             ; address of descriptor
+        SUBL3     PATCH_DESC_TRG_BEGIN(R7), -      ; size of target area
+                  PATCH_DESC_TRG_END(R7), R1       ; ...
+        MOVL      PATCH_DESC_LOOKUP_FOUND(R7), R0  ; located patch pointer to "lookup"
+        BEQL      10$                              ; unexpected: patch not found
+        ADDL      PATCH_DESC_TRG_BEGIN(R7), R0     ; advance from "lookup" to "trg"
+        SUBL      PATCH_DESC_LOOKUP_BEGIN(R7), R0  ; ...
+        JSB       G^MMG$LOCK_SYSTEM_PAGES_CALL     ; lock system pages
+10$:
+        RET                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+        .ENTRY    K_UNLOCK_SYSTEM_PAGES, ^M<R7>
+        .ENABLE   LOCAL_BLOCK
+        BBS       #PATCH_ID_NUMTIM, -              ; bs - skip NUMTIM patch
+                  ARG_NOPATCH(AP), 10$             ; ...
+        MOVAB     PATCHDESC_NUMTIM, R7             ; address of descriptor
+        SUBL3     PATCH_DESC_TRG_BEGIN(R7), -      ; size of target area
+                  PATCH_DESC_TRG_END(R7), R1       ; ...
+        MOVL      PATCH_DESC_LOOKUP_FOUND(R7), R0  ; located patch pointer to "lookup"
+        BEQL      10$                              ; unexpected: patch not found
+        ADDL      PATCH_DESC_TRG_BEGIN(R7), R0     ; advance from "lookup" to "trg"
+        SUBL      PATCH_DESC_LOOKUP_BEGIN(R7), R0  ; ...
+        JSB       G^MMG$UNLOCK_SYSTEM_PAGES_CALL   ; unlock system pages
+10$:
+        RET                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;+
+;
+;  Locate loadable executive image.
+;  Should be called in kernel mode at IPL <= ASTDEL.
+;
+;       uint32 k_locate_ldr_img(int namelen, char* name, uint32* range, uint32* is_valid);
+;
+;  Returns at caller's IPL.
+;  Always return success status.
+;
+;  If image is not present, range will be set to {0,0} and *is_valid to false.
+;  If image is present, range will be set to its whole range, and *is_valid to 
+;  ether true or false, depending on whether the image had been initialized.
+;
+;-
+        ARG_NAMELEN = 4
+        ARG_NAME = 8
+        ARG_RANGE = 12
+        ARG_ISVALID = 16
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    K_LOCATE_LDR_IMG, ^M<R2,R3,R4,R5,R6,R7>
+        SAVIPL    -(SP)                            ; save caller's IPL
+        MOVL      G^CTL$GL_PCB, R4                 ; lock image list mutex
+        MOVAB     G^EXE$GL_BASIMGMTX, R0           ; ...
+        JSB       G^SCH$LOCKR                      ; ...
+        MOVAB     G^LDR$GQ_IMAGE_LIST, R6          ; image listhead address
+        MOVL      R6, R7                           ; ...
+10$:
+        MOVL      (R7), R7                         ; get next image block
+        BGEQ      50$                              ; geq - null or invalid pointer
+        CMPL      R7, R6                           ; end of list?
+        BEQL      50$                              ; eql - end scan
+        CMPB      LDRIMG$B_IMGNAMLEN(R7), -        ; compare image name length
+                  ARG_NAMELEN(AP)                  ; ...
+        BNEQ      10$                              ; neq - go try next block
+        MOVZBL    ARG_NAMELEN(AP), -(SP)           ; compare image name
+        PUSHL     ARG_NAME(AP)                     ; ...
+        PUSHAB    LDRIMG$T_IMGNAM(R7)              ; ...
+        CALLS     #3, K_STREQI_CNT                 ; ...
+        BLBC      R0, 10$                          ; lbc - does not match - go try next
+        MOVL      ARG_RANGE(AP), R0                ; found the block, copy address range
+        MOVL      LDRIMG$L_BASE(R7), (R0)          ; ...
+        MOVL      LDRIMG$L_BASE(R7), 4(R0)         ; ...
+        MOVL      LDRIMG$L_PAGE_COUNT(R7), R1      ; ...
+        ASHL      #9, R1, R1                       ; ...
+        DECL      R1                               ; ...
+        ADDL      R1, 4(R0)                        ; ...
+        EXTZV     #LDRIMG$V_VALID, #1, -           ; copy "valid" flag
+                  LDRIMG$L_FLAGS(R7), -            ; to the caller's location
+                  @ARG_ISVALID(AP)                 ; ...
+20$:
+        MOVL      G^CTL$GL_PCB, R4                 ; unlock the mutex
+        MOVAB     G^EXE$GL_BASIMGMTX, R0           ; ...
+        JSB       G^SCH$UNLOCK                     ; ...
+        SETIPL    (SP)+, -                         ; restore caller's IPL
+                  ENVIRON=UNIPROCESSOR             ; ...
+        MOVZBL    #SS$_NORMAL, R0                  ; always return success status
+        RET                                        ; to the caller
+50$:
+        MOVL      ARG_RANGE(AP), R0                ; image not found: clear range
+        CLRQ      (R0)                             ; ...
+        CLRL      @ARG_ISVALID(AP)                 ; and "valid" flag
+        BRB       20$                              ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Lookup patches. Check if required patch areas are present and findable and sets up
+;  internal table with addresses of code to be patched.
+;
+;  Called in user mode.
+;
+;       uint32 lookup_patches(uint32 nopatch);
+;
+;  Return VMS-structured status.
+;
+;  Note that some patches are found elsewhere, such as in prepare_xqdrv_patches().
+;
+;-
+        ARG_NOPATCH = 4
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    LOOKUP_PATCHES, ^M<R2>
+        BBS       #PATCH_ID_XDELTA, -              ; check if XDELTA patch is disabled
+                  ARG_NOPATCH(AP), 10$             ; bs - skip it
+        MOVL      #VSMP_MSG_XDELTA_P, R2           ; assume error status code
+        CALLS     #0, LOOKUP_PATCH_XDELTA          ; lookup patch
+        XBLBC     R0, 310$                         ; lbc - return error
+10$:
+        BBS       #PATCH_ID_CHSEP, -               ; check if CHSEP patch is disabled
+                  ARG_NOPATCH(AP), 20$             ; bs - skip it
+        PUSHL     #^X00DD                          ; offset past transfer address
+        PUSHAB    G^SCH$CHSEP                      ; transfer vector
+        PUSHAB    PATCHDESC_CHSEP                  ; descriptor address
+        CALLS     #3, LOOKUP_PATCH_D               ; lookup CHSEP pach
+        XBLBC     R0, 300$                         ; lbc - return error
+20$:
+        BBS       #PATCH_ID_RESCHED, -             ; check if RESCHED patch is disabled
+                  ARG_NOPATCH(AP), 30$             ; bs - skip it
+        PUSHL     #^X00A2                          ; offset past transfer address
+        PUSHAB    G^SCH$RESCHED                    ; transfer vector
+        PUSHAB    PATCHDESC_RESCHED                ; descriptor address
+        CALLS     #3, LOOKUP_PATCH_D               ; lookup RESCHED pach
+        XBLBC     R0, 300$                         ; lbc - return error
+30$:
+        BBS       #PATCH_ID_NUMTIM, -              ; check if NUMTIM patch is disabled
+                  ARG_NOPATCH(AP), 40$             ; bs - skip it
+        MOVL      #VSMP_MSG_NUMTIM_P, R2           ; assume error
+        TSTL      MSG_RTNS_RANGE                   ; check if message_routines.exe is located
+        XBEQL     310$                             ; eql - return error
+        ADDL3     #^X5373, MSG_RTNS_RANGE, -(SP)   ; load approx. address
+        PUSHAB    PATCHDESC_NUMTIM                 ; descriptor address
+        CALLS     #2, LOOKUP_PATCH_DA              ; lookup NUMTIM pach
+        XBLBC     R0, 300$                         ; lbc - return error
+40$:
+        BBS       #PATCH_ID_UCBTMO, -              ; check if UCBTMO patch is disabled
+                  ARG_NOPATCH(AP), 50$             ; bs - skip it
+        MOVL      #VSMP_MSG_UCBTMO_P, R2           ; assume error
+        CMPW      G^EXE$TIMEOUT, JMP_INSTR         ; check EXE$TIMEOUT vector is JMP @#
+        XBNEQ     310$                             ; neq - unexpected
+        ADDL3     #^XCB, G^EXE$TIMEOUT+2, -(SP)    ; load approx. address
+        PUSHAB    PATCHDESC_UCBTMO                 ; descriptor address
+        CALLS     #2, LOOKUP_PATCH_DA              ; lookup NUMTIM pach
+        XBLBC     R0, 300$                         ; lbc - return error
+50$:
+        BBS       #PATCH_ID_CRBTMO, -              ; check if CRBTMO patch is disabled
+                  ARG_NOPATCH(AP), 60$             ; bs - skip it
+        MOVL      #VSMP_MSG_CRBTMO_P, R2           ; assume error
+        CMPW      G^EXE$TIMEOUT, JMP_INSTR         ; check EXE$TIMEOUT vector is JMP @#
+        BNEQ      310$                             ; neq - unexpected
+        ADDL3     #^X66, G^EXE$TIMEOUT+2, -(SP)    ; load approx. address
+        PUSHAB    PATCHDESC_CRBTMO                 ; descriptor address
+        CALLS     #2, LOOKUP_PATCH_DA              ; lookup NUMTIM pach
+        XBLBC     R0, 300$                         ; lbc - return error
+60$:
+        BBS       #PATCH_ID_MFYCAP, -              ; check if MFYCAP patch is disabled
+                  ARG_NOPATCH(AP), 70$             ; bs - skip it
+        MOVL      #VSMP_MSG_MFYCAP_P, R2           ; assume error
+        CMPW      G^SCH$REMOVE_CPU_CAP + 2, -      ; check SCH$REMOVE_CPU_CAP vector is .WORD ^M<...>, JMP @#
+                  JMP_INSTR                        ; ...
+        BNEQ      310$                             ; neq - unexpected
+        ADDL3     #^XCD, G^SCH$REMOVE_CPU_CAP+4, -(SP)    ; load approx. address
+        PUSHAB    PATCHDESC_MFYCAP                 ; descriptor address
+        CALLS     #2, LOOKUP_PATCH_DA              ; lookup NUMTIM pach
+        XBLBC     R0, 300$                         ; lbc - return error
+70$:
+        MOVZBL    #SS$_NORMAL, R0                  ; return success status
+300$:
+        RET                                        ; to the caller
+310$:
+        MOVL      R2, R0                           ; return error status
+        RET                                        ; to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Lookup XDelta patch area
+;
+;-
+        .ENTRY    LOOKUP_PATCH_XDELTA, ^M<>
+        .ENABLE   LOCAL_BLOCK
+        ;
+        ;  set up exception handling for possible exceptions
+        ;  while comparing the code
+        ;
+        MOVAB     20$, LOOKUP_PATCH_EXC_RESUME     ; set up ACCVIO handler
+        MOVAB     LOOKUP_PATCH_EXC_HANDLER, (FP)   ; ...
+        ;
+        ;  get address of XDELBPT routine
+        ;
+        MOVAB     G^XDT$BPT, R0                    ; XDELBPT should be pointed
+        CMPW      (R0)+, JMP_INSTR                 ; by XDT$BPT as JMP #@XDELBPT
+        BNEQ      20$                              ; ...
+        MOVL      (R0), R0                         ; fetch XDELBPT address
+        CLRL     (FP)                              ; reset condition handler
+        ;
+        ;  the code for XDELTA_WHAMI precedes XDELBPT, look it up
+        ;
+        SUBL      #<XDT_PAT_LOOK_E - XDT_PAT_LOOK>, R0    ; approximate location
+        PUSHAB    XDT_TRG_E                        ; end of lookup pattern
+        PUSHAB    XDT_TRG                          ; start of lookup pattern
+        PUSHL     #10                              ; max offset after
+        PUSHL     #10                              ; max offset before
+        PUSHL     R0                               ; approximate address
+        CALLS     #5, LOOKUP_CODE                  ; lookup the code
+        BLBC      R0, 20$                          ; lbc - not found
+        MOVL      LOOKUP_CODE_ADDR, -              ; save found location to patch table
+                  PATCHDESC_XDELTA + PATCH_DESC_LOOKUP_FOUND
+10$:
+        MOVZBL    #SS$_NORMAL, R0                  ; return success status
+        RET                                        ; to the caller
+20$:
+        MOVL      #VSMP_MSG_XDELTA_P, R0           ; return error status code
+        RET                                        ; to the caller
+        .DISABLE  LOCAL_BLOCK
+
+        .ENTRY    LOOKUP_PATCH_EXC_HANDLER, ^M<>   ; condition handler invoked on exception during code search
+        .ENABLE   LOCAL_BLOCK
+        MOVL      CHF$L_SIGARGLST(AP), R0          ; get signal array pointer
+        CMPL      CHF$L_SIG_ARGS(R0), #5           ; check if ACCVIO
+        BNEQ      10$                              ; ...
+        CMPL      CHF$L_SIG_NAME(R0), -            ; ...
+                  #SS$_ACCVIO                      ; ...
+        BNEQ      10$                              ; ...
+        MOVL      LOOKUP_PATCH_EXC_RESUME, 16(R0)  ; modify PC to resume execution at
+        MOVZWL    #SS$_CONTINUE, R0                ; resume executuion at error handler
+        RET                                        ; ...
+10$:
+        MOVZWL    #SS$_RESIGNAL, R0                ; resignal unexpected exception
+        RET                                        ; ...
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Lookup patch area.
+;  Called in user mode.
+;
+;  Arguments:
+;      4(AP) = patch descriptor address
+;      8(AP) = transfer vector (must be JMP@# or JSB@# structured)
+;     12(AP) = offset from the transfer vector target, as approximate position
+;
+;-
+        ARG_DESC = 4
+        ARG_XFER_VEC = 8
+        ARG_XFER_OFFSET = 12
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    LOOKUP_PATCH_D, ^M<R7>
+        MOVL      ARG_DESC(AP), R7                 ; patch descriptor address
+        MOVL      ARG_XFER_VEC(AP), R0             ; extract transfer vector's
+        CMPW      (R0), JMP_INSTR                  ; ... target address
+        BEQL      10$                              ; ...
+        CMPW      (R0), JSB_INSTR                  ; ...
+        BNEQ      110$                             ; neq - bad or unexpected vector
+10$:
+        MOVL      2(R0), R0                        ; target address
+        ADDL3     ARG_XFER_OFFSET(AP), R0, -       ; add offset and store in the descriptor
+                  PATCH_DESC_LOOKUP_START(R7)      ; as starting point for code lookups
+20$:
+        ADDL3     R7, PATCH_DESC_LOOKUP_END(R7), -(SP)    ; end of pattern
+        ADDL3     R7, PATCH_DESC_LOOKUP_BEGIN(R7), -(SP)  ; start of pattern
+        PUSHL     PATCH_DESC_LOOKUP_AFTER(R7)      ; lookup range
+        PUSHL     PATCH_DESC_LOOKUP_BEFORE(R7)     ; ...
+        PUSHL     PATCH_DESC_LOOKUP_START(R7)      ; lookup start
+        CALLS     #5, LOOKUP_CODE                  ; lookup the code
+        BLBC      R0, 110$                         ; lbc - not found
+        MOVL      LOOKUP_CODE_ADDR, -              ; save found location to patch table
+                  PATCH_DESC_LOOKUP_FOUND(R7)      ; ...
+        MOVZBL    #SS$_NORMAL, R0                  ; return success status
+        RET                                        ; to the caller
+110$:
+        MOVL      PATCH_DESC_ERROR_STATUS(R7), R0  ; return error status 
+        RET                                        ; to the caller
+
+;
+;  Alternate entry point.
+;  Arguments:
+;      4(AP) = patch descriptor address
+;      8(AP) = starting address for lookup
+;
+        ARG_DESC = 4
+        ARG_START = 8
+;
+        .ENTRY    LOOKUP_PATCH_DA, ^M<R7>
+        MOVL      ARG_DESC(AP), R7                 ; patch descriptor address
+        MOVL      ARG_START(AP), R0                ; starting lookup address
+        MOVL      R0, PATCH_DESC_LOOKUP_START(R7)  ; store in the descriptor
+                                                   ; as starting point for code lookups
+        BRB       20$                              ; join common code
+        .DISABLE  LOCAL_BLOCK
+
+
+;;;
+;;; XDELTA patch lookup template (preliminary)
+;;;
+
+XDT_PAT_LOOK:
+        MOVL      (SP),-(SP)
+        WHAMI     4(SP)
+        RSB
+        .ASCIZ    /STEPOVER/
+        .ASCIZ    / BRK AT /
+XDT_PAT_LOOK_E:
+
+        .PSECT    $DATA LONG, NOSHR, WRT, PIC, NOEXE
+
+LOOKUP_PATCH_EXC_RESUME:                         ; execution resume address for 
+        .BLKL                                    ; ... LOOKUP_PATCH_EXC_HANDLER
+
+LOOKUP_CODE_ADDR::                               ; located address retured by
+        .BLKL                                    ; ... LOOKUP_CODE
+
+XDELTA_RANGE::                                   ; address range of XDelta
+        .LONG     0, 0
+
+MSG_RTNS_RANGE::                                 ; address range of MESSAGE_ROUTINES.EXE
+        .LONG     0, 0
+
+
+;;;
+;;; XQTIMXMT patch source template
+;;; for code located in XQDRIVER routine SUB_START_CTRL_TIMER
+;;; in module [PGV_LAN.SRC]DEQNA.MAR
+;;;
+        X_QNA$C_XMT_TMO = 5                      ; these values may change across XQDRIVER and VMS versions
+        X_LSB$G_QNA_TIMXMT = ^XC4E               ; and matter here only approximately, as falling either in
+        X_QNA$C_SID_MINTIM = ^X1E0               ; "word offset" or "byte offset" category or, for QNA$C_XMT_TMO
+        X_LSB$G_QNA_TIMSID = ^XC50               ; and QNA$C_SID_MINTIM, as being either a "short immediate
+        X_LSB$G_QNA_TQE = ^XC54                  ; operand" (with value <= 63) or above 63
+        X_QNA$C_TQE_DELTA = 10000000
+
+XQDRV_PAT_1::         ;; located approximately at XQDRIVER + ^X1AD3
+        MOVB    #X_QNA$C_XMT_TMO, X_LSB$G_QNA_TIMXMT+1(R4)
+        MOVW    #X_QNA$C_SID_MINTIM, X_LSB$G_QNA_TIMSID+2(R4)
+        MOVAL   X_LSB$G_QNA_TQE(R4),R5
+        MOVL    #<<DYN$C_TQE@16>!TQE$C_LENGTH>, TQE$W_SIZE(R5)
+        MOVQ    #X_QNA$C_TQE_DELTA, TQE$Q_DELTA(R5)
+        MOVQ    R3,TQE$L_FR3(R5)
+        MOVAL   W^X_QNA$CTRL_TIMER_EXP, TQE$L_FPC(R5)
+XQDRV_PAT_2::         ;; located approximately at XQDRIVER + ^X1B02
+        MOVB    #TQE$C_SSREPT, TQE$L_RQPID(R5)
+        MOVB    TQE$L_RQPID(R5), TQE$B_RQTYPE(R5)
+        READ_SYSTIME R0
+        ADDL    TQE$Q_DELTA(R5),R0
+        ADWC    TQE$Q_DELTA+4(R5),R1
+        JSB     G^EXE$INSTIMQ
+XQDRV_PAT_2E == . + 2
+        MOVW    X_LSB$G_QNA_TIMSID+2(R4), X_LSB$G_QNA_TIMSID(R4)
+X_QNA$CTRL_TIMER_EXP = .
+
+        .END

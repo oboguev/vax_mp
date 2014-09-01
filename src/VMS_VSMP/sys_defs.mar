@@ -1,0 +1,49 @@
+;;
+;;  Importing various VMS definitons
+;;
+;;  Module:     sys_defs.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev
+;;  Created:    11-Dec-2011
+;;  Revision History:
+;;      none
+;;
+
+        .MACRO    SYS_DEFS
+
+        $ACBDEF         ; AST control block
+        $ARBDEF         ; access rights block
+        $CHFDEF         ; exception handling structures
+        $CPBDEF         ; CPU capabilities
+        $CPUDEF         ; per-CPU database
+        $DYNDEF GLOBAL  ; dynamic structures codes (GLOBAL exports to C)
+        $FKBDEF         ; fork block
+        $IDBDEF         ; interrupt dispatch block
+        $IPLDEF         ; interrupt priority levels
+        $PCBDEF         ; software process control block
+        $PHDDEF         ; process header
+        $PRDEF          ; processor registers
+        $PRIDEF         ; priority boost classes
+        $PRVDEF         ; privileges
+        $PSLDEF         ; processor status longword
+        $SPLDEF         ; spinlock structure
+        $SPLCODDEF      ; spinlock indexes and SMP flags
+        $TQEDEF         ; timer queue entry
+        $UCBDEF GLOBAL  ; unit control block
+        $SSDEF          ; system services status codes
+
+        ;
+        ;  Check if should enter into benign wait state because of XDelta 
+        ;
+        .MACRO    XDELTA_WAIT  ?L
+        BBS       #15, G^XDT$GW_OWNER_ID, L      ; if bs - no CPU in XDELTA
+        DSBINT    ENVIRON=UNIPROCESSOR           ; disable interrupts
+        JSB       G^XDT$CPU_WAIT                 ; enter a benign wait state
+        ENBINT                                   ; CPU had left XDELTA, restore IPL
+L:      .BLKB     0                              ; ... and resume execution
+        .ENDM     XDELTA_WAIT
+
+        .MACRO    SYS_DEFS
+        .ENDM     SYS_DEFS
+
+        .ENDM     SYS_DEFS

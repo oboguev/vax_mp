@@ -1,0 +1,1437 @@
+        .TITLE    KLOAD
+        .IDENT    /V1.00/
+
+;;
+;;  Kernel-mode loadable code for SIMH VMS virtual SMP utility.
+;;  Root part: loads resident image to kernel, interfaces with command line utility.
+;;
+;;  Tested with OpenVMS VAX version 7.3.
+;;
+;;  Module:     kload.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev (oboguev@yahoo.com)
+;;  Created:    10-Dec-2011
+;;  Revision History:
+;;              none
+;;
+        .LIBRARY  "SYS$LIBRARY:LIB"
+
+        SYS_DEFS           ; common VMS definitions
+        $KA650DEF          ; KA650 CPU specific definitions
+        $CRBDEF    GLOBAL  ; channel request block (make GLOBAL for importing from C)
+        $DCDEF             ; device classes and types
+        $DDBDEF    GLOBAL  ; device data block (make GLOBAL for importing from C)
+        $DPTDEF    GLOBAL  ; driver prologue table (make GLOBAL for importing from C)
+        $IRPDEF            ; IO request packet
+        $SBDEF     GLOBAL  ; VAXcluster node system descriptor block (GLOBAL for C)
+        $PTEDEF            ; page table entry
+
+        XBRANCH            ; Extended branch instructions
+        SIMHDEF            ; SIMH API definitions
+
+        ;
+        ;  VAX MP will elevate VCPU thread priority when the thread is executing
+        ;  at IPL SYS_CRITICAL and above
+        ;
+        IPL$_SYS_CRITICAL == IPL$_QUEUEAST
+
+        ;
+        ;  IPL for VAX MP interprocessor interrupts
+        ;
+        IPL$_IPINTR = 22
+
+        .PSECT    $CODE LONG, SHR, NOWRT, PIC, EXE
+
+;;***********************************************************************************
+;;  Utility routines to assist loader
+;;***********************************************************************************
+
+;+
+;
+;  Write address of SIMH VAX MP API request block to VAX MP communication register.
+;  Should be called in user mode.
+;
+;       void mtpr_simh(unit32* args);
+;
+;  If request is disallowed will throw exception.
+;
+;-
+        ARG_ADDR = 4
+;
+        .ENTRY    MTPR_SIMH, ^M<>
+        MTPR      ARG_ADDR(AP), #PR$_SIMH
+        RET
+
+;+
+;
+;  Check whether multiprocessing system image is loaded and if any drivers not
+;  modified for SMP are loaded on the system.
+;
+;       uint32 k_check_smp_enabled(uint32* enabled, uint32* unmod_driver);
+;
+;  Returns VMS-structured status.
+;  If successful, will boolean responses to locations pointed by "enabled"
+;  and "unmod_driver".
+;
+;-
+        ARG_ENABLED = 4
+        ARG_UNMOD_DRIVER = 8
+;
+        .ENTRY    K_CHECK_SMP_ENABLED, ^M<>
+        EXTZV     #SMP$V_ENABLED, #1, G^SMP$GL_FLAGS, @ARG_ENABLED(AP)
+        EXTZV     #SMP$V_UNMOD_DRIVER, #1, G^SMP$GL_FLAGS, @ARG_UNMOD_DRIVER(AP)
+        MOVZBL    #SS$_NORMAL, R0
+        RET
+
+;+
+;
+;  Allocate a block of non-paged pool upto 63KB in size.
+;
+;       uint32 kmalloc_kb64(uint32 size, void** paddr);
+;
+;  Returns VMS-structured status.
+;  If successful, will return the address of the loaded block to *paddr.
+;
+;-
+        ARG_SIZE = 4
+        ARG_PADDR = 8
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KMALLOC_KB64, ^M<R2, R3, R4, R5>
+        CLRL      @ARG_PADDR(AP)                 ; clear for failure
+        MOVL      ARG_SIZE(AP), R1               ; allocate block of requested size
+        JSB       G^EXE$ALONONPAGED              ; ...
+        BLBC      R0, 10$                        ; failed? return error status
+        MOVL      R2, @ARG_PADDR(AP)             ; store address
+        MOVW      R1, PCB$W_SIZE(R2)             ; store allocated block size in the block
+10$:
+        RET                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Deallocate a block to non-paged pool allocated with kmalloc_kb64.
+;
+;      void kfree_kb64(void* p)
+;
+;-
+        ARG_ADDR = 4
+;
+        .ENTRY    KFREE_KB64, ^M<R2, R3, R4, R5>
+        MOVL      ARG_ADDR(AP), R0               ; get block address
+        CLRB      PCB$B_TYPE(R0)                 ; clear block type (MSB = 0 indicates non-shared memory)
+        JSB       G^EXE$DEANONPAGED              ; deallocate
+        RET                                      ; return to the caller
+
+;+
+;
+;  Allocate a block of non-paged pool of arbitrary size.
+;
+;       uint32 kmalloc_anysize(uint32 reqsize, void** paddr, uint32* pblksize);
+;
+;  "reqsize" - requested size of the block to allocate.
+;
+;  Returns VMS-structured status.
+;  If successful, will return the address of the loaded block to *paddr and the
+;  actual size of allocated block to *pblksize.
+;
+;-
+        ARG_SIZE = 4
+        ARG_PADDR = 8
+        ARG_PBLKSIZE = 12
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KMALLOC_ANYSIZE, ^M<R2, R3, R4, R5>
+        CLRL      @ARG_PADDR(AP)                 ; clear for failure
+        MOVL      ARG_SIZE(AP), R1               ; allocate block of requested size
+        JSB       G^EXE$ALONONPAGED              ; ...
+        BLBC      R0, 10$                        ; failed? return error status
+        MOVL      R2, @ARG_PADDR(AP)             ; store address
+        MOVL      R1, @ARG_PBLKSIZE(AP)          ; store allocated block size
+10$:
+        RET                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Deallocate a block to non-paged pool allocated with kmalloc_anysize.
+;
+;      void kfree_anysize(void* p, uint32 blksize)
+;
+;-
+        ARG_ADDR = 4
+        ARG_BLKSIZE = 8
+;
+        .ENTRY    KFREE_ANYSIZE, ^M<R2, R3, R4, R5>
+        MOVL      ARG_ADDR(AP), R0               ; get block address
+        MOVL      ARG_BLKSIZE(AP), R1            ; get block size
+        JSB       G^EXE$DEANONPGDSIZ             ; deallocate
+        RET                                      ; return to the caller
+
+;+
+;
+;  Flush instruction stream after executable code was modified.
+;
+;      void kload_flush_instruction_stream();
+;
+;-
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KLOAD_FLUSH_INSTRUCTION_STREAM, ^M<>
+        MOVPSL    -(SP)                          ; execute REI to flush instruction stream
+        MOVAB     10$, -(SP)                     ; ...
+        REI                                      ; ...
+10$:
+        RET                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Copy memory block.
+;
+;      void kmemcpy(void* dst, const void* src, uint32 size);
+;
+;  "size" is in bytes.
+;  "src" and "dst" should not overlap, otherwise results are unpredictable.
+;
+;-
+        ARG_DST = 4
+        ARG_SRC = 8
+        ARG_SIZE = 12
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KMEMCPY, ^M<R2, R3, R4, R5, R6>
+        MOVL      ARG_SIZE(AP), R6               ; load arguments
+        MOVL      ARG_SRC(AP), R1                ; ...
+        MOVL      ARG_DST(AP), R3                ; ...
+10$:
+        CMPL      R6, #^XFFF0                    ; fits 64K block?
+        BLEQU     20$                            ; lequ - yes, move last part
+        MOVC      #^XFFF0, (R1), (R3)            ; move first or next part
+        SUBL      #^XFFF0, R6                    ; reduce remaining counter
+        BRB       10$                            ; next iteration
+20$:
+        MOVC      R6, (R1), (R3)                 ; move last segment
+        RET                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Verify if already loaded kernel-resident block is compatible with the current SMP.EXE image.
+;
+;       int kload_verify_compatible(void* addr);
+;
+;  Argument is the address of the resident block.
+;  Returns VMS-structured status.
+;
+;-
+        ARG_ADDR = 4
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KLOAD_VERIFY_COMPATIBLE, ^M<>
+        MOVL      ARG_ADDR(AP), R0               ; get block address
+        MOVAB     KLOAD_START, R1                ; get prototype address in the current image
+        MOVAB     KVC_HANDLER, (FP)              ; establish condition handler to catch invalid
+                                                 ; (non-readable) resident block address
+        ;
+        ;  Compare basic header fields
+        ;
+        CMPL      12(R0), 12(R1)                 ; compare signature
+        BNEQ      10$                            ; ...
+        CMPL      16(R0), 16(R1)                 ; ...
+        BNEQ      10$                            ; ...
+        CMPL      20(R0), 20(R1)                 ; compare interface version
+        BNEQ      10$                            ; ...
+        CMPL      24(R0), 24(R1)                 ; compare implementation version
+        BNEQ      10$                            ; ...
+        ;
+        ;  Verify that offsets of routines exported by the loaded resident image from system space 
+        ;  match present executable image
+        ;
+        MOVAB     <EXPORTS_OFFSET_TABLE - KLOAD_START>(R0), R0
+        MOVAB     <EXPORTS_OFFSET_TABLE - KLOAD_START>(R1), R1
+        CMPL      (R0)+, (R1)+                   ; kcall_onload
+        BNEQ      10$                            ; ...
+        CMPL      (R0)+, (R1)+                   ; kcall_get_idle
+        BNEQ      10$                            ; ...
+        CMPL      (R0)+, (R1)+                   ; kcall_set_idle
+        BNEQ      10$                            ; ...
+        CMPL      (R0)+, (R1)+                   ; kcall_get_timesync
+        BNEQ      10$                            ; ...
+        CMPL      (R0)+, (R1)+                   ; kcall_set_timesync
+        BNEQ      10$                            ; ...
+        ;
+        ;  Finished checking
+        ;
+        CLRL      (FP)                           ; cancel condition handler
+        MOVZBL    #SS$_NORMAL, R0                ; return status: compatible
+        RET                                      ; ...
+10$:    
+        MOVL      #VSMP_MSG_VERSION_MISMATCH, R0 ; return error status: loaded image mismatches current VSMP executable
+        RET                                      ; ...
+
+        .ENTRY    KVC_HANDLER, ^M<>              ; condition handler invoked if resident block is unreadable
+        MOVL      CHF$L_SIGARGLST(AP), R0        ; get signal array pointer
+        CMPL      CHF$L_SIG_ARGS(R0), #5         ; check if ACCVIO
+        BNEQ      20$                            ; ...
+        CMPL      CHF$L_SIG_NAME(R0), -          ; ...
+                  #SS$_ACCVIO                    ; ...
+        BNEQ      20$                            ; ...
+        MOVAB     10$, 16(R0)                    ; modify PC to resume execution at
+        MOVZWL    #SS$_CONTINUE, R0              ; resume executuion at error handler
+        RET                                      ; ...
+20$:
+        BUG_CHECK INVEXCEPTN,FATAL               ; invalid exception
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Lock IO database for reading or writing.
+;
+;       void iodb_lock_rd();
+;       void iodb_lock_wr();
+;
+;  These functions must be called at IPL <= ASTDEL and return at IPL ASTDEL.
+;
+;-
+        .ENTRY    IODB_LOCK_RD, ^M<R2,R3,R4>
+        MOVL      G^CTL$GL_PCB, R4
+        JSB       G^SCH$IOLOCKR
+        RET
+
+        .ENTRY    IODB_LOCK_WR, ^M<R2,R3,R4>
+        MOVL      G^CTL$GL_PCB, R4
+        JSB       G^SCH$IOLOCKW
+        RET
+
+;+
+;
+;  Unlock IO database.
+;
+;       void iodb_unlock(uint32 ipl);
+;
+;  These functions must be called at IPL = ASTDEL.
+;  May ponentially also be called at any level that may acquire SCHED spinlock,
+;  but currently this code is pageable, so ASTDEL is the highest caller's IPL allowed.
+;
+;  At exit resets IPL to "ipl".
+;
+;-
+        ARG_IPL = 4
+;
+        .ENTRY    IODB_UNLOCK, ^M<R2,R3,R4>
+        MOVL      G^CTL$GL_PCB, R4
+        JSB       G^SCH$IOUNLOCK
+        MTPR      ARG_IPL(AP), S^#PR$_IPL
+        RET
+
+
+;+
+;
+;  Get address of local system descriptor block (SB).
+;
+;       void* get_localsb_addr();
+;
+;-
+        .ENTRY    GET_LOCALSB_ADDR, ^M<>
+        MOVL      G^SCS$AR_LOCALSB, R0
+        RET
+
+
+;;***********************************************************************************
+;;  Loader part locked in the process working set
+;;***********************************************************************************
+
+KLOAD_WSLOCK_START::                             ; start of section locked into working set
+
+;+
+;
+;  Calibrate processor loops.
+;
+;       uint32 kload_calibrate_sysloops(uint32* tenusec, uint32* ubdelay)
+;
+;  Values of EXE$GL_TENUSEC, EXE$GL_UBDELAY, CPU$L_TENUSEC and CPU$L_UBDELAY are restored
+;  at the exit of call to the values at entrance.
+;
+;  Must be called before SMP is activated.
+;
+;-
+        TENUSEC = 4
+        UBDELAY = 8
+;
+        .ENTRY    KLOAD_CALIBRATE_SYSLOOPS, ^M<R2, R3>
+
+        FIND_CPU_DATA   R1                       ; locate CPU database
+
+        DSBINT    ENVIRON=UNIPROCESSOR           ; disable interrupts
+
+        PUSHL     G^EXE$GL_TENUSEC               ; save previous calibration
+        PUSHL     G^EXE$GL_UBDELAY               ; ...
+        JSB       G^EXE_INI_TIMWAIT              ; perform calibration using private version of EXE$INI_TIMWAIT
+
+        MOVL      G^EXE$GL_TENUSEC, R2           ; save new calibration
+        MOVL      G^EXE$GL_UBDELAY, R3           ; ...
+
+        POPL      G^EXE$GL_UBDELAY               ; restore previous calibration
+        POPL      G^EXE$GL_TENUSEC               ; ...
+        MOVL      G^EXE$GL_UBDELAY, CPU$L_UBDELAY(R1)    ; ...
+        MOVL      G^EXE$GL_TENUSEC, CPU$L_TENUSEC(R1)    ; ...
+
+        ENBINT                                   ; re-enable interrupts
+
+        MOVL      R2, @TENUSEC(AP)               ; return measured values
+        MOVL      R3, @UBDELAY(AP)               ; ...
+        MOVZBL    #SS$_NORMAL, R0                ; ...
+        RET                                      ; to the caller
+
+;+
+;
+;  Apply new calibration of processor loops.
+;
+;       uint32 kload_apply_calibration(uint32 tenusec, uint32 ubdelay);
+;
+;  Changes values of EXE$GL_TENUSEC, EXE$GL_UBDELAY, CPU$L_TENUSEC and CPU$L_UBDELAY.
+;
+;  Must be called before SMP is activated.
+;
+;-
+        TENUSEC = 4
+        UBDELAY = 8
+;
+        .ENTRY    KLOAD_APPLY_CALIBRATION, ^M<R2, R3>
+        MOVL      TENUSEC(AP), R2                ; get parameters
+        MOVL      UBDELAY(AP), R3                ; ...
+        FIND_CPU_DATA   R1                       ; locate CPU database
+        DSBINT    ENVIRON=UNIPROCESSOR           ; disable interrupts
+
+        MOVL      R2, G^EXE$GL_TENUSEC           ; apply new calibration
+        MOVL      R2, CPU$L_TENUSEC(R1)          ; ...
+
+        MOVL      R3, G^EXE$GL_UBDELAY           ; ...
+        MOVL      R3, CPU$L_UBDELAY(R1)          ; ...
+
+        ENBINT                                   ; re-enable interrupts
+
+        MOVZBL    #SS$_NORMAL, R0                ; return
+        RET                                      ; to the caller
+
+
+;+
+;
+;  EXE_INI_TIMWAIT - compute TIMEWAIT loop values
+;
+;  This routine is a modified private variant of EXE$INI_TIMWAIT (its version for KA650).
+;  Unlike the original EXE$INI_TIMWAIT it does not call INI$CACHE to reinitialize the cache.
+;
+;  This private variant is needed because SIMH implementation of MicroVAX 3900 simulator
+;  uses a hack whereby it can provide 512MB memory configuration. Unfortunately memory
+;  region above 256MB overlaps KA650 CDG space. This works fine, as long as the operating system
+;  does not try to use CDG space after the system had been booted. In case of VMS it does
+;  not do that natively, but if we called EXE$INI_TIMWAIT (that in turn calls INI$CACHE)
+;  this is exactly what would have happened: 64KB memory region slightly above 256 MB boundary
+;  would have been cleared, wiping out all the data in these pages.
+;
+;  Therefore we cannot call regular system copy of EXE$INI_TIMWAIT to recalibrate loops and 
+;  have to use a private modified copy of this routine instead.
+;
+;  EXE_INI_TIMWAIT computes and sets valus of cells CPU$L_TENUSEC and CPU$L_UBDELAY that provide 
+;  calibration data for busy-wait macros (such as TIMEWAIT and TIMEDWAIT) and other busy-wait loops 
+;  that spin for a certain pre-defined number of cycles instead of reading the processor clock.
+;  Instead, calculated number of iteration cycles of calibrated loops translates to a required delay.
+;
+;  CPU$L_UBDELAY is the number of times a calibrated loop must be executed for 3 usec delay.
+;  Delaying by 3 usec between references to QBus or Unibus space (such as by bit-test instruction
+;  inside TIMEWAIT macros or indirectly via TIMEDWAIT) prevents excessively high frequency of
+;  polling references to the bus space that can saturate it. CPU$L_UBDELAY driven loop introduces
+;  3 usec delay between such references to the bus inside TIMEWAIT bit-test loop.
+;
+;  CPU$L_TENUSEC is the number of times a calibrated loop must be executed for 10 usec delay.
+;
+;  Note that actual busy-wait loops may (and commonly will) take more time to execute each iteration
+;  than the calibration loop. They can have more instructions per iteration. Also SMP busy-wait loops
+;  typically use BBSSI or other interlocked instruction in place of BITW in the prototype loop
+;  which is much more expensive on VAX MP than BITW. The purpose of calibration loop is to provide
+;  not exact timing for target loops, but minimal guaranteed timing.
+;
+;  Also note that since modern host processors that SIMH executes on are much faster than Mayfair VAXen,
+;  the number of iterations during UBDELAY calibration is increased approximately 20-fold compared
+;  to EXE$INI_TIMWAIT in order to obtain more precise and stable calibration reading.
+;
+;  Inputs:
+;
+;       Interval timers.
+;       Kernel mode, memory management enabled, IPL >= ASTDEL
+;
+;  Outputs:
+;
+;       R0 - Destroyed.
+;
+;       CPU$L_TENUSEC - set to appropriate value to make TIMEWAIT and TIMEDWAIT
+;                       macros loop for 10 usec
+;
+;       CPU$L_UBDELAY - set to appropriate value to make TIMEWAIT and TIMEDWAIT
+;                       macros loop for 3 usec
+;
+;-
+
+        ;
+        ;  set up and start real-time timer for loop calibration
+        ;
+        .MACRO    BEGIN_TMR
+        CLRL      KA650$L_TNIR0(R2)                      ; reset "timer next interval" register
+        MOVL      #<KA650$M_TCR_RUN!KA650$M_TCR_XFR>, -  ; start timer, do not signal interrupts
+                  KA650$L_TCR0(R2)                       ; using initial timer run value in TNIR0
+        .ENDM     BEGIN_TMR
+
+        ;
+        ;  stop real-time timer and compute calibration
+        ;
+        .MACRO    END_TMR NCYC, CALIBR
+        MOVL      KA650$L_TIR0(R2), R0                   ; read total time it took to execute the loop (usecs)
+        CLRL      KA650$L_TCR0(R2)                       ; stop timer
+        DIVL3     R0, NCYC, CALIBR                       ; calculate number of times to execute the loop
+        INCL      CALIBR                                 ; ... for specified (3 usec or 10 usec) delay
+        .ENDM     END_TMR
+
+        .ENABLE   LOCAL_BLOCK
+        ;
+        ;  routine to set up time-wait calibration data
+        ;
+EXE_INI_TIMWAIT:
+        PUSHL     R1                                     ; save scratch registers
+        PUSHL     R2                                     ; ...
+        FIND_CPU_DATA   R1                               ; locate per-CPU database
+
+        ;;; BSBW    INI$CACHE                            ; do **not** reinitialize the cache
+
+        MOVL      G^EXE$GL_CPUNODSP, R2                  ; virtual address of CPU node private space
+        PUSHL     #400000                                ; number of times to execute calibration loop
+        BEGIN_TMR                                        ; reset and start real-time clock timer
+;
+; Start of UBDELAY loop being calibrated.
+; UBDELAY loop is executed to provide delay for 3 usec intervals (or multiple of 3 usec intervals).
+;
+10$:    SOBGTR    (SP), 10$                              ; delay loop body
+;
+; End of UBDELAY calibration loop.
+;
+        END_TMR   #1200000, CPU$L_UBDELAY(R1)            ; stop timer and calculate number of times to execute
+                                                         ; ... UBDELAY loop for 3 usec delay
+;
+; Calibration of UBDELAY loop is completed.
+; Now set up for calibration of TENUSEC loop.
+;
+        MOVL      #20000, R0                             ; number of times to execute calibrated loop
+        BEGIN_TMR                                        ; reset and start real-time clock timer
+
+;
+; Start of TENUSEC loop being calibrated.
+; TENUSEC loop is executed to delay for 10 usec (or multiple of 10 usec) intervals.
+;
+20$:    BITW      #^X4000, 900$                          ; arbitrary BITx instruction to simulate loop pattern
+        BNEQ      40$                                    ; arbitrary conditional branch instruction to simulate loop pattern
+        MOVL      CPU$L_UBDELAY(R1), (SP)                ; refill 3 ussec delay loop iteration count
+30$:    SOBGTR    (SP), 30$                              ; delay 3 usec
+40$:    SOBGTR    R0, 20$                                ; go next outer loop iteration
+;
+; End of TENUSEC calibration loop.
+;
+        END_TMR   #200000, CPU$L_TENUSEC(R1)             ; stop timer and calculate number of times to execute
+                                                         ; ... TENUSEC loop for 10 usec delay
+
+        MOVL      CPU$L_TENUSEC(R1), G^EXE$GL_TENUSEC    ; store CPU calibration data to system-wide locations
+        MOVL      CPU$L_UBDELAY(R1), G^EXE$GL_UBDELAY    ; ...
+                  
+        TSTL      (SP)+                                  ; pop delay-loop counter off the stack
+
+        POPL      R2                                     ; restore scratch registers
+        POPL      R1                                     ; ...
+        RSB                                              ; return to the caller
+
+        .ALIGN    LONG
+900$:
+        .LONG     0                                      ; cell referenced by calibration loop bit-test instruction
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Enable/disable process deletion.
+;
+;       void kload_set_process_deletable(bool_t deletable)
+;
+;  If "deletable" is TRUE, process is set deletable.
+;  If "deletable" is FALSE, process is set undeletable.
+;
+;-
+        ARG_DELETABLE = 4
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KLOAD_SET_PROCESS_DELETABLE, ^M<R2, R4>
+        MOVZBL    ARG_DELETABLE(AP), R2          ; get flag value from paged area
+        LOCK      LOCKNAME=SCHED, -              ; synchonize access to the PCB
+                  SAVIPL=-(SP), -                ; ...
+                  PRESERVE=NO                    ; ...
+        MOVL      G^CTL$GL_PCB,R4                ; Get current PCB address
+        TSTL      R2                             ; check requested action
+        BEQL      10$                            ; eql - disable delete
+        BICL      #PCB$M_NODELET,-               ; enable process deletion
+                  PCB$L_STS(R4)                  ; ...
+        BRB       20$
+10$:
+        BISL      #PCB$M_NODELET,-               ; disable process deletion
+                  PCB$L_STS(R4)                  ; ...
+20$:
+        UNLOCK    LOCKNAME=SCHED, -              ; release SCHED spinlock and revert IPL
+                  PRESERVE=NO, -                 ; ... do not preserve R0
+                  NEWIPL=(SP)+                   ; ...
+        RET
+        .DISABLE  LOCAL_BLOCK
+
+
+;+
+;
+;  Set UCB's affinity.
+;
+;       void k_set_ucb_affinity(void* ucb, uint32 affinity);
+;
+;  Called and returns at IPL = ASTDEL with IODB lock held.
+;
+;-
+        ARG_UCB = 4
+        ARG_AFFINITY = 8
+;
+        .ENTRY    K_SET_UCB_AFFINITY, ^M<R5>
+        MOVL      ARG_UCB(AP), R5
+        FORKLOCK  -
+                  LOCK=UCB$B_FLCK(R5), -         ; lock fork level access to UCB
+                  SAVIPL=-(SP), -                ; save current IPL
+                  PRESERVE=NO                    ; don't save R0
+        MOVL      ARG_AFFINITY(AP), -            ; set unit affinity
+                  UCB$L_AFFINITY(R5)             ; ...
+        FORKUNLOCK -                             ; unlock fork lock
+                  LOCK=UCB$B_FLCK(R5), -         ; ...
+                  NEWIPL=(SP)+, -                ; restore previous IPL
+                  PRESERVE=NO                    ; ...
+        RET                                      ; return to the caller
+
+
+;+
+;
+;  Extend fork-to-primary pool size to at least "npages".
+;  Limit is 255 pages.
+;  Called at IPL 0 to ASTDEL before VSMP is started.
+;
+;       uint32 k_extend_pfork_pool(int npages);
+;
+;  Returns status code.
+;
+;-
+        ARG_NPAGES = 4
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    K_EXTEND_PFORK_POOL, ^M<R2, R3, R4, R5, R6, R7, R8>
+        MOVL      ARG_NPAGES(AP), R6             ; limit page count to 255
+        CMPL      R6, #255                       ; ... to be storable in
+        BLEQU     10$                            ; ... SMP$GB_PFORK_POOL_SIZE
+        MOVZBL    #255, R6                       ; ...
+10$:
+        LOCK      LOCKNAME=MMG, -                ; acquire MMG spinlock
+                  LOCKIPL=IPL$_SYNCH, -          ; ...
+                  SAVIPL=-(SP)                   ; ... and store caller's IPL
+        CMPB      R6, G^SMP$GB_PFORK_POOL_SIZE   ; is existing pool already large enough?
+        BLEQU     200$                           ; lequ - yes, just exit with success status
+        MOVL      R6, R2                         ; allocate required number of SPTEs
+        JSB       G^LDR$ALLOC_PT_SYNC            ; ...
+        BLBC      R0, 210$                       ; lbc - return error to the caller
+        SUBL3     G^LDR$GL_SPTBASE, R1, R3       ; calculate base address
+        ASHL      #<9-2>, R3, R7                 ; and initalize buffer pointer
+        BISL      #^X80000000, R7                ; ...
+        MOVL      R7, R8                         ; set up SVA of current page for the loop below
+30$:    
+        PUSHL     R1                             ; preserve R1
+        JSB       G^MMG$ALLOCPFN                 ; allocate one PFN
+        POPL      R1                             ; restore R1
+        TSTL      R0                             ; was PFN successfully allocated?
+        BLEQ      220$                           ; leq - no
+        BISL3     #<PTE$M_VALID!PTE$C_ERKW!PTE$C_KOWN>, R0, (R1)+   ; map page
+        MTPR      R8, S^#PR$_TBIS                ; invalidate TLB entry
+        ADDL      #512, R8                       ; advance to SVA of next page
+        SOBGTR    R2,30$                         ; go get PFN for next page
+;
+;  Set pool address and initialize the listhed. Listhead contains a FLINK and
+;  a blocksize as the first 2 longwords of each block.
+;
+        DSBINT    #IPL$_POWER, -(SP), -          ; block interrupts while we are switching pool
+                  ENVIRON=UNIPROCESSOR           ; ...
+        MOVB      R6, G^SMP$GB_PFORK_POOL_SIZE   ; store pool size (page count)
+        MOVL      R7, G^SMP$GL_PFORK_POOL        ; set pool address
+        CLRL      (R7)+                          ; zero FLINK (single block on free list)
+        MULL3     R6, #512, (R7)                 ; and set the block size
+        ENBINT    (SP)+                          ; restore IPL
+200$:
+        MOVZBL    #SS$_NORMAL, R0                ; return status = success
+210$:
+        UNLOCK    LOCKNAME=MMG, -                ; unlock MMG lock
+                  NEWIPL=(SP)+, -                ; ... restore caller's IPL
+                  PRESERVE=YES                   ; ... preserve R0
+        RET                                      ; return to the caller
+220$:   
+        MOVL      #VSMP_MSG_ALLOCPFN, R0         ; return error code
+        BRB       210$                           ; ...
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+; Disable driver unloading.
+;
+;     void pin_driver(void* dpt);
+;
+; Argument "dpt" is the address of the driver's prologue table.
+;
+;-
+        ARG_DPT = 4
+;
+        .ENTRY    PIN_DRIVER, ^M<>
+        MOVL      ARG_DPT(AP), R0                ; driver DPT address
+        BISB      #DPT$M_NOUNLOAD, -             ; set NOUNLOAD flag
+                  DPT$B_FLAGS(R0)                ; ...
+        MOVZBL    #SS$_NORMAL, R0                ; return success code
+        RET                                      ; just in case
+
+;+
+;
+; Change transmit timeout of XQ device.
+;
+;     void set_xq_xmt_timeout(void* ucb, uint32 lsb_xmt_tmo, uint32 timeout);
+;
+; Entrance IPL is ASTDEL (but may be any).
+; Returs at caller's original IPL.
+;
+; Arguments:
+;
+;     "ucb" - UCB of any XQ unit for this conroller, typically XQx0
+;     "lsb_xmt_tmo" - offset of LSB$G_QNA_TIMXMT in XQDRIVER's LSB structure
+;     "timeout" - timeout to set, in seconds, must be between 5 and 255
+;
+;+
+        ARG_UCB = 4
+        ARG_LSB_XMT_TMO = 8
+        ARG_TIMEOUT = 12
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    SET_XQ_XMT_TIMEOUT, ^M<R2>
+        DSBINT    #IPL$_POWER, -(SP), -              ; block interrupts while we are changing system structures
+                  ENVIRON=UNIPROCESSOR               ; ...
+        MOVL      ARG_UCB(AP), R0                    ; get UCB address
+        CMPB      UCB$B_DEVTYPE(R0), #DT$_DEQNA      ; skip if not DEQNA or DELQA
+        BEQL      10$                                ; ...
+        CMPB      UCB$B_DEVTYPE(R0), #DT$_XQ_DELQA   ; ...
+        BNEQ      100$                               ; ...
+10$:
+        MOVL      UCB$L_CRB(R0), R0                  ; get CRB address
+        BGEQ      100$                               ; nx - should never happen
+        MOVL      CRB$L_AUXSTRUC(R0), R0             ; get LSB address
+        BGEQ      100$                               ; null - was not allocated yet
+        CMPB      IRP$B_TYPE(R0), #DYN$C_CDB         ; check block type matches used for LSB
+        BNEQ      100$                               ; ...
+        MOVZWL    IRP$W_SIZE(R0), R1                 ; check XMT_TMO fits inside this LSB
+        SUBL      #2, R1                             ; ...
+        CMPL      ARG_LSB_XMT_TMO(AP), R1            ; ...
+        BGTR      100$                               ; ...
+        ADDL      ARG_LSB_XMT_TMO(AP), R0            ; address of LSB$G_QNA_TIMXMT, 2 bytes
+        ;
+        ;  LSB$G_QNA_TIMXMT is two bytes.
+        ;  Low byte is 0 if timeout is currently not active, otherwise countdown timer.
+        ;  High byte is timeout refill value, copied to low byte when timeout is started.
+        ;
+        ;  High byte will be 0 if this LSB had not been initialzied yet.
+        ;  In this case, do not set timeout in it. Enlarged timeout value will be set in this LSB later 
+        ;  by XQPATCH_INS_1 when associated link will be initialzied. That it will be set, is insured by 
+        ;  calling patch_xqdrv_instr before invoking set_xq_xmt_timeout.
+        ;
+        TSTB      1(R0)                              ; timeout not initialized yet in this LSB?
+        BEQL      100$                               ; eql - not initialized, skip this LSB
+        CMPB      1(R0), ARG_TIMEOUT(AP)             ; new timeout must be larger than old "refill"
+        BGEQU     100$                               ; geq - do not change it
+        SUBB3     1(R0), ARG_TIMEOUT(AP), R1         ; calc insrease delta
+        MOVZBL    R1, R1                             ; ...
+        MOVZBL    (R0), R2                           ; calc new "active" timeout
+        BEQL      30$                                ; eql - inactive, leave it
+        ADDL      R1, R2                             ; ...
+        CMPL      R2, #255                           ; must not exceed 255
+        BLEQ      20$                                ; ...
+        MOVZBL    #255, R2                           ; ...
+20$:
+        MOVB      R2, (R0)                           ; set current "active" timeout
+30$:
+        MOVB      ARG_TIMEOUT(AP), 1(R0)             ; set current "refill" timeout
+100$:
+        ENBINT    (SP)+                             ; restore caller's IPL
+        MOVZBL    #SS$_NORMAL, R0                   ; return success code
+        RET                                         ; just in case
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;  Break to debugger
+;-
+        .ENTRY    DBG_BRK, ^M<>
+        BPT
+        RET
+
+KLOAD_WSLOCK_END == . - 1                        ; end of section locked into working set
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- header
+;;***********************************************************************************
+
+        .PSECT    KLOAD_AAA QUAD, PIC, EXE, SHR, NOWRT
+KLOAD_START::
+        ;; start of loadable part header, first part is standard VMS block header
+        .LONG     0                              ; standard VMS block header
+        .LONG     0                              ; ...
+        .WORD     0                              ; ... block size (left 0)
+        .BYTE     DYN$C_SPECIAL                  ; ... block type
+        .BYTE     0                              ; ...
+        ;; end of VMS block header, followed by specific image id header
+        .ASCII    "VSMP$LDR"                     ; signature of the header of the loadable image
+        .LONG     1                              ; version of the interface
+        .LONG     1                              ; version of the implementation
+        .LONG     0                              ; unload routine or nil
+KLOAD_BLKSIZE::
+        .LONG     0                              ; size of the block
+EXPORTS_OFFSET_TABLE:
+        .LONG     KCALL_ONLOAD - KLOAD_START
+        .LONG     KCALL_GET_IDLE - KLOAD_START
+        .LONG     KCALL_SET_IDLE - KLOAD_START
+        .LONG     KCALL_GET_TIMESYNC - KLOAD_START
+        .LONG     KCALL_SET_TIMESYNC - KLOAD_START
+        ;; end of loadable part header
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- data
+;;***********************************************************************************
+
+        .PSECT    KLOAD_DATA QUAD, PIC, EXE, NOSHR, WRT
+KERROR_CAUSE::
+        .BLKL                                    ; error cause returned to the caller
+
+SYNCW_ON::            .LONG   0                  ; synchronization window control
+SYNCW_WINSIZE_SYS::   .LONG   0                  ; ...
+SYNCW_WINSIZE_ILK::   .LONG   0                  ; ...
+SMP_MUST_OPTIONS::    .LONG   0                  ; SIMH SMP options control
+SMP_WANT_OPTIONS::    .LONG   0                  ; ...
+
+PROC_IDLE_OLD:
+        .BLKL                                    ; saved address of old EXE$PROC_IDLE handler
+
+IDLE_CTRL::                                      ; idle loop control
+        .BLKB                                    ; SIM_K_IDLE_ON/SIM_K_IDLE_OFF/SIM_K_IDLE_NEVER
+
+CRLF:
+        .BYTE     ^X0D, ^X0A, ^X00               ; console print line postiflx
+
+JMP_INSTR:
+        JMP       @#^X80001234                   ; JMP G^xxx instruction template
+
+NX_JMP_INSTR:
+        JMP       G^EXE$LOAD_ERROR_JSB           ; JMP template for non-existing instruction vector (6 bytes)
+
+NX_JSB_INSTR:
+        JSB       G^EXE$LOAD_ERROR_JSB           ; JSB template for non-existing instruction vector
+        RSB                                      ; ... (7 bytes including RSB)
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- code
+;;***********************************************************************************
+
+        .PSECT    KLOAD_CODE QUAD, PIC, EXE, SHR, NOWRT
+;+
+;
+;  Called to initialize at loading time.
+;
+;       uint32 kcall_onload(uint32 cpu_mask, uint32 idle, uint32 timesync, uint32 nopatch);
+;
+;  Argument "idle" is initial idle status: SIM_K_IDLE_ON/SIM_K_IDLE_OFF/SIM_K_IDLE_NEVER.
+;  Returns VMS-structured status.
+;
+;  This routine is executed in uniprocessor configuration, before secondary processors
+;  are configured into system yet.
+;
+;  Entrance IPL must be 0 to ASTDEL.
+;  Returns at the caller's original IPL.
+;
+;-
+        ARG_CPU_MASK = 4
+        ARG_IDLE = 8
+        ARG_TIMESYNC = 12
+        ARG_NOPATCH = 16
+;
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KCALL_ONLOAD, ^M<>
+        CLRL      KERROR_CAUSE                   ; no error cause yet
+        MOVB      ARG_IDLE(AP), IDLE_CTRL        ; store idle control setting
+        MOVB      ARG_TIMESYNC(AP), TIMESYNC_CTRL    ; store TIMESYNC control setting
+        DSBINT    #IPL$_POWER, -(SP), -          ; block interrupts while we are patching system code
+                  ENVIRON=UNIPROCESSOR           ; ...
+        PUSHL     ARG_NOPATCH(AP)                ; check if dynamic patches can be applied
+        CALLS     #1, CHECK_PATCHES              ; ...
+        XBLBC     R0, 200$                       ; lbc - cannot, return error
+        ;
+        ;  Check if idle patch can be performed
+        ;
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_NEVER   ; will run idle?
+        XBEQL     100$                           ; eql - never, do not patch idle code
+        ;
+        ;  Check that SCH$CUR_TO_COM is not present.
+        ;  Routine SCH$CUR_TO_COM was deleted in 1991 and used to contain "CLRL G^SCH$GL_IDLE_CPUS"
+        ;  that we may have wanted to handle intelligently (except in IDLE NEVER mode) if it were present
+        ;  since it wakes up all the CPUs to schedule just one process. Even in IDLE NEVER mode,
+        ;  and likewise on real hardware VAXen, it would have caused a bank run on the SCHED lock.
+        ;
+        MOVL      #VSMP_MSG_LDR_SCH_CUR_TO_COM, -           ; assume error
+                  KERROR_CAUSE                              ; ...
+        CMPL      G^SCH$CUR_TO_COM, NX_JMP_INSTR            ; check SCH$CUR_TO_COM aganst non-loaded JMP vector
+        BNEQ      20$                                       ; ...
+        CMPW      G^SCH$CUR_TO_COM + 4, NX_JMP_INSTR + 4    ; ...
+        BEQL      30$                                       ; ...
+20$:
+        CMPL      G^SCH$CUR_TO_COM, NX_JSB_INSTR            ; check SCH$CUR_TO_COM aganst non-loaded JSB/RSB vector
+        XBNEQ     300$                                      ; ...
+        CMPW      G^SCH$CUR_TO_COM + 4, NX_JSB_INSTR + 4    ; ...
+        XBNEQ     300$                                      ; ...
+        CMPB      G^SCH$CUR_TO_COM + 6, NX_JSB_INSTR + 6    ; ...
+        XBNEQ     300$                                      ; ...
+30$:
+        ;
+        ;  Hook into EXE$PROC_IDLE
+        ;
+        MOVL      #VSMP_MSG_LDR_EXE_PROC_IDLE, - ; assume error
+                  KERROR_CAUSE                   ; ...
+        CMPW      G^EXE$PROC_IDLE, JMP_INSTR     ; patch EXE$PROC_IDLE vector
+        XBNEQ     300$                           ; ... neq - unexpected structure
+        MOVL      G^EXE$PROC_IDLE+2, -           ; ... save old routine address
+                  PROC_IDLE_OLD                  ; ...
+        MOVAB     PROC_IDLE, -                   ; ... set new address
+                  G^EXE$PROC_IDLE + 2            ; ...
+100$:
+        ;
+        ;  Signal to virtual machine monitor (SIMH)
+        ;
+        CLRL      -(SP)                          ; idle sleep enabled/disabled status
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_ON      ; ...
+        BNEQ      110$                           ; ...
+        MOVZBL    #1, (SP)                       ; ...
+110$:
+        PUSHL     #IPL$_RESCHED                  ; synchronization window control
+        PUSHL     #IPL$_QUEUEAST                 ; ...
+        PUSHL     SYNCW_WINSIZE_ILK              ; ...
+        PUSHL     SYNCW_WINSIZE_SYS              ; ...
+        PUSHL     SYNCW_ON                       ; ...
+        CLRL      -(SP)                          ; placeholder for granted options
+        PUSHL     SMP_WANT_OPTIONS               ; requested options
+        PUSHL     SMP_MUST_OPTIONS               ; ...
+        CLRL      -(SP)                          ; guest OS version (0 = not specific)
+        PUSHL     #1                             ; guest OS id (1 = VMS)
+        PUSHAB    G^SCH$GL_IDLE_CPUS             ; address of cpu idle mask
+        PUSHL     #IPL$_SYS_CRITICAL             ; sys critical section level
+        CLRL      -(SP)                          ; response status placeholder
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_INIT_SMP         ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        MOVL      12(SP), R0                     ; save response
+        ADDL      #<16*4>, SP                    ; remove argument block off the stack
+        CMPL      R0, #1                         ; check for successful response
+        BEQL      190$                           ; ok - go to successful exit
+        ;
+        ;  Simulator rejected SMP initiation
+        ;
+        MOVB      #SIM_K_IDLE_NEVER, IDLE_CTRL   ; shut off idle loop control
+        MOVB      #SIM_K_TIMESYNC_OFF, -         ; ... and TimeSync
+                  TIMESYNC_CTRL                  ; ...
+        MOVL      R0, KERROR_CAUSE               ; return error code
+        MOVL      #VSMP_MSG_VM_REFUSED, R0       ; ...
+        BRB       200$                           ; ...
+190$:
+        FIND_CPU_DATA   R1                       ; locate CPU database
+        MTPR      R1, S^#PR$_WHAMI               ; set up WHAMI register for the primary
+        PUSHL     ARG_NOPATCH(AP)                ; apply dynamic patches
+        CALLS     #1, APPLY_PATCHES              ; ...
+        BSBW      VSMP$SETUP_SMP                 ; set up SMP environment
+        ;
+        ;  Increase count of interlocked instruction retries to at least that hardwired
+        ;  in $INSQHI/$INSQTI/$REMQHI/$REMQTI macros, i.e. 900000, unless it is already
+        ;  set even higher and unless increasng it is disabled by NOPATCH option.
+        ;
+        CMPL      G^EXE$GL_LOCKRTRY, #900000     ; already higher?
+        BGEQ      195$                           ; geq - skip
+        BBS       #PATCH_ID_LOCKRTRY, -          ; bs - change is disabled
+                  ARG_NOPATCH(AP), 195$          ; ...
+        MOVL      #900000, G^EXE$GL_LOCKRTRY     ; set to number used by $INSQHI and co.
+195$:
+        MOVL      ARG_CPU_MASK(AP), -            ; set mask of available CPUs
+                  G^SMP$GL_CPUCONF               ; ...
+        CLRL      KERROR_CAUSE                   ; no error
+        MOVZBL    #SS$_NORMAL, R0                ; returns success code
+200$:
+        ;
+        ; common return handler
+        ;
+        BLBC      R0, 210$                       ; if about to perform successful return, activate TimeSync TQE
+        SETIPL    #IPL$_TIMER, -                 ; ... drop IPL to TIMER lock
+                  ENVIRON=UNIPROCESSOR           ; ...
+        PUSHL     R0                             ; ... preserve register across the call
+        BSBW      ACTIVATE_TIMESYNC_TQE          ; ... set up and activate TQE
+        POPL      R0                             ; ... restore register
+210$:                                            ; ...
+        ENBINT    (SP)+                          ; restore caller's IPL
+        RET                                      ; return to the caller
+300$:
+        MOVL      #VSMP_MSG_LDR_VERIFY, R0       ; common pre-load verification error return
+        BRB       200$                           ; ...
+        .DISABLE  LOCAL_BLOCK
+
+
+;+
+;
+;  Get and set current idle control.
+;
+;       uint32 kcall_get_idle(uint32* idle);
+;       uint32 kcall_set_idle(uint32 idle);
+;
+;  Caller is responsible for validating the supplied "idle" value.
+;  Returns VMS-structured status.
+;
+;-
+        ARG_IDLE = 4
+;
+        .ENTRY    KCALL_GET_IDLE, ^M<>
+        MOVZBL    IDLE_CTRL, @ARG_IDLE(AP)       ; return the value
+        MOVZBL    #SS$_NORMAL, R0                ; return success status
+        RET                                      ; ...
+
+        .ENABLE   LOCAL_BLOCK
+        .ENTRY    KCALL_SET_IDLE, ^M<>
+        LOCK      LOCKNAME=SCHED, -              ; synchronize access to SCH$GL_IDLE_CPUS
+                  SAVIPL=-(SP), -                ; ...
+                  PRESERVE=NO                    ; ...
+        MOVB      ARG_IDLE(AP), IDLE_CTRL        ; store new setting
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_ON      ; if enabling idle, just return
+        BEQL      10$                            ; ...
+        CLRL      G^SCH$GL_IDLE_CPUS             ; if disabling idle, wakeup all other CPUs
+        CLRL      G^VBSS$GL_STALLED_CPUS         ; ... and clear the mask of CPUs stalled for RBS
+10$:
+        UNLOCK    LOCKNAME=SCHED,-               ; release SCHED spinlock and revert IPL
+                  PRESERVE=NO,-                  ; ...
+                  NEWIPL=(SP)+                   ; ...
+        ;
+        ;  notify the simulator
+        ;
+        CLRL      -(SP)                          ; response status placeholder
+        CLRL      -(SP)                          ; idle sleep enabled/disabled status
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_ON      ; ...
+        BNEQ      20$                            ; ...
+        MOVZBL    #1, (SP)                       ; ...
+20$:
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_SET_IDLE         ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      #<5*4>, SP                     ; remove argument block off the stack
+        MOVZBL    #SS$_NORMAL, R0                ; return success status
+        RET                                      ; to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Output string to console.
+;
+;       void kprint(const char* s);
+;       void kprint_crlf(const char* s);
+;
+;  Prints string to console.
+;  The latter version adds CR/LF at the end.
+;
+;  Print hexadecimal:
+;
+;       void kprint_x8_value(uint32 val);
+;
+;  Print prefix followed by hexadecimal:
+;
+;       void kprint_x8(const char* s, uint32 val);
+;
+;  Print prefix followed by hexadecimal and CR-LF:
+;
+;       void kprint_x8_crlf(const char* s, uint32 val);
+;
+;-
+        ARG_STR = 4
+;
+        .ENTRY    KPRINT, ^M<R2, R11>
+        MOVL      ARG_STR(AP), R1
+        CLRL      R11
+        JSB       G^EXE$OUTZSTRING
+        RET
+
+        .ENTRY    KPRINT_CRLF, ^M<R2, R11>
+        CALLG     (AP), KPRINT
+        PUSHAB    CRLF
+        CALLS     #1, KPRINT
+        RET
+;
+        ARG_VAL = 4
+;
+        .ENTRY    KPRINT_X8_VALUE, ^M<R2, R11>
+        MOVL      ARG_VAL(AP), R1
+        CLRL      R11
+        JSB       G^EXE$OUTHEX
+        RET
+;
+        ARG_STR = 4
+        ARG_VAL = 8
+;
+        .ENTRY    KPRINT_X8, ^M<R2, R11>
+        PUSHL     ARG_STR(AP)
+        CALLS     #1, KPRINT
+        PUSHL     ARG_VAL(AP)
+        CALLS     #1, KPRINT_X8_VALUE
+        RET
+;
+        ARG_STR = 4
+        ARG_VAL = 8
+;
+        .ENTRY    KPRINT_X8_CRLF, ^M<R2, R11>
+        PUSHL     ARG_STR(AP)
+        CALLS     #1, KPRINT
+        PUSHL     ARG_VAL(AP)
+        CALLS     #1, KPRINT_X8_VALUE
+        PUSHAB    CRLF
+        CALLS     #1, KPRINT
+        RET
+
+;+
+;
+;  Idle loop handler.
+;  Called by SCH$RESCHED idle loop.
+;
+;  Inputs:
+;      R3 points to CPU database
+;      R1 contains CPU$L_PHY_CPUID(R3)
+;      locks not held
+;      IPL = RESCHED
+;
+;  Output:
+;      Preserve registers except R0.
+;      The value of R0 at exit (LBS/LBC) controls loop flow, see the source for SCH$RESCHED.
+;      This routine always returns R0 LBC, to avoid the loop shifting to the next stage
+;      where EXE$PROC_IDLE is no longer polled.
+;
+;-
+        .ENABLE   LOCAL_BLOCK
+PROC_IDLE:
+        PUSHL     R6                             ; save registers
+        PUSHL     R7                             ; ...
+        MOVL      G^EXE$GL_ABSTIM_TICS, R6       ; get tick count at the start of this idle wait
+10$:
+        JSB       @PROC_IDLE_OLD                 ; call previous handler if any
+        XBLBC     R0, 110$                       ; LBC - return
+        XBBC      #CPB$V_RUN, -                  ; run capability present?
+                  CPU$L_CAPABILITY(R3), 100$     ; ...
+        XBBC      CPU$L_PHY_CPUID(R3), -         ; is processor still idle?
+                  G^SCH$GL_IDLE_CPUS, 100$       ; ...
+        TSTL      G^SCH$GL_TBSH                  ; is class scheduler present?
+        BEQL      20$                            ; ...
+        JSB       G^SCH$CLASS_IDLE               ; call class scheduler
+        XBBC      #CPB$V_RUN, -                  ; run capability present?
+                  CPU$L_CAPABILITY(R3), 100$     ; ...
+        XBBC      CPU$L_PHY_CPUID(R3), -         ; is processor still idle?
+                  G^SCH$GL_IDLE_CPUS, 100$       ; ...
+20$:
+        CMPB      IDLE_CTRL, #SIM_K_IDLE_ON      ; is SIMH-level sleep enabled
+        BNEQ      30$                            ; neq - no, do not attempt it
+        ;
+        ;  call VMM to enter sleep mode
+        ;
+        BSBW      CALC_IDLE_SLEEP_TICKS          ; calculate ticks to sleep -> R0
+        PUSHL     R0                             ; ticks to sleep
+        CLRL      -(SP)                          ; response status placeholder
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_IDLE             ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      #<5*4>, SP                     ; remove argument block off the stack
+        BRB       90$
+30$:
+        ;
+        ;  call VMM to signal idle loop pulse... does not cause sleep,
+        ;  but can be used by VMM to reset synchronization window
+        ;
+        CLRL      -(SP)                          ; response status placeholder
+        PUSHL     #1                             ; guest API version
+        PUSHL     #VAXMP_API_OP_IDLE_PULSE       ; request code
+        PUSHL     #VAXMP_API_SIGNATURE           ; request block signature
+        MTPR      SP, #PR$_SIMH                  ; signal to SIMH
+        ADDL      #<4*4>, SP                     ; remove argument block off the stack
+90$:
+        ;;
+        ;; as a safety net, once every 1/2 seconds mark current CPU as non-idle
+        ;; and cause it to re-attempt scheduling
+        ;;
+        ;; this may come helpful for example when class scheduler is started or fails,
+        ;; since routine make_tbs_jobs_computable in [SYS.SRC]SYSSCHED.B32 called in these
+        ;; cases does not clear SCH$GL_IDLE_CPUS
+        ;;
+        SUBL3     R6, G^EXE$GL_ABSTIM_TICS, R7   ; get number of ticks passed since PROC_IDLE was called
+        CMPL      R7, #50                        ; more than 1/2 second?
+        XBLSSU    10$                            ; lssu - no
+        LOCK      LOCKNAME=SCHED, -              ; mark this processor as not idle to re-attemp scheduling
+                  LOCKIPL=#IPL$_SYNCH            ; ...
+        BICL      CPU$L_CPUID_MASK(R3), -        ; ...
+                  G^SCH$GL_IDLE_CPUS             ; ...
+        UNLOCK    LOCKNAME=SCHED, -              ; ...
+                  NEWIPL=#IPL$_RESCHED           ; ...
+100$:
+        CLRL      R0                             ; status: do not shift to the next idle loop phase
+110$:
+        POPL      R7                             ; restore registers
+        POPL      R6                             ; ...
+        RSB                                      ; ...
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Calculate number of ticks for VAX MP simulator idle sleep
+;
+;  Inputs:
+;      R3 points to CPU database
+;      IPL = RESCHED
+;
+;  Output:
+;      Preserve all registers except R0.
+;      The value of R0 at exit contains number of ticks to sleep.
+;          0 => can sleep till the end of current clock tick (i.e. next HWCLK interrupt)
+;          1 => till the end of current tick and then for one full tick after it
+;          2 => till the end of current tick and then for two full ticks after it
+;          . . . .
+;          N => till the end of current tick and then for N full ticks after it
+;
+;  For the primary CPU always returns 0.
+;  Primary CPU maintains time for all other VCPUs and performs other system-wide activity
+;  that other VCPUs depend on, and it cannot be allowed to sleep multiple ticks.
+;
+;  Secondary VCPUs can sleep multiple ticks. Primary limitation is that SMP sanity check
+;  should not be triggerred.
+;
+;  On every hardware clock interrupt each processor reinitializes its CPU$W_SANITY_TIMER
+;  to the value of SGN$GW_SMP_SANITY_CNT (SYSGEN SMP_SANITY_CNT parameter, with default value 300).
+;
+;  Every SGN$GW_SMP_TICK_CNT ticks (SYSGEN parameter SMP_TICK_CNT, default value 30)
+;  previous processor in the SMP sanity monitoring chain substracts SGN$GW_SMP_TICK_CNT from
+;  this processor's CPU$W_SANITY_TIMER. If the result is below zero, bugcheck is generated.
+;
+;  Theoretically idling secondary CPU can be allowed to sleep up to (CPU$W_SANITY_TIMER - 1) ticks,
+;  i.e. under default value of parameters for almost 300 seconds. In practice much shorter idle
+;  sleep period time must be used. If we allowed long sleep intervals close to SGN$GW_SMP_SANITY_CNT,
+;  previous processor in the chain could wake up from sleep and jump at us performing multiple
+;  back-to-back clock interrupts (sent by VAX MP in back-to-back fashion) and substract
+;  close SGN$GW_SMP_SANITY_CNT from our CPU$W_SANITY_TIMER, putting the system on the threshold
+;  of bugcheck. To prevent this from happenning and maintain sufficient safety margin, we limit
+;  the duration of idle sleep to at most a quarter of the maximum sanity interval.
+;
+;  Furthermore, to prevent any unexpected and unintended effects we limit secondaries idle sleep
+;  duraton to at most 1/2 second (50 ticks). This provides very low overhead, and there is no
+;  inscentive to use longer sleep intervals.
+;
+;  We employ algorithm that calculates idle sleep time (R ticks) as follows:
+;
+;      RMAX = SGN$GW_SMP_SANITY_CNT / 4           ; maximum idle sleep time
+;      RMAX = min(50, RMAX)                       ; but not more than 0.5 second
+;      SAFE_MARGIN = max(RMAX, 100)               ; want to have at least this many ticks left
+;                                                 ; after worst-case substraction, to provide
+;                                                 ; safrty margn against host scheduler delaying
+;                                                 ; execution of our VCPU thread and hence delaying
+;                                                 ; processing the clock interrupt that would refill
+;                                                 ; our CPU$W_SANITY_TIMER
+;      R = thiscpu.CPU$W_SANITY_TIMER - SGN$GW_SMP_TICK_CNT    ; SGN$GW_SMP_TICK_CNT can be substracted any time
+;      R -= RMAX                                  ; RMAX can be sustracted any time
+;      R -= SAFE_MARGIN                           ; want to have SAFE_MARGIN left
+;      R = min(R, RMAX)                           ; do not sleep longer than RMAX
+;      R = max(0, R)                              ; not less than 0
+;
+;  Under regular circumstances this algorithm will usually produce a value of R close to 50 ticks (0.5 seconds).
+;
+;-
+        .ENABLE   LOCAL_BLOCK
+CALC_IDLE_SLEEP_TICKS:
+        ASSUME    CPB$V_PRIMARY EQ 0
+        BLBC      CPU$L_CAPABILITY(R3), 10$        ; if LBC, this is a secondary CPU
+        CLRL      R0                               ; primary - return 0
+        RSB                                        ; to the caller
+10$:
+        PUSHL     R1                               ; preserve scratch registers
+        PUSHL     R2                               ; ...
+        MOVZWL    G^SGN$GW_SMP_SANITY_CNT, R1      ; R1 = RMAX
+        DIVL      #4, R1                           ; ...
+        CMPL      R1, #50                          ; ...
+        BLEQ      20$                              ; ...
+        MOVZBL    #50, R1                          ; ...
+20$:
+        MOVL      R1, R2                           ; R2 = SAFE_MARGIN
+        CMPL      R2, #100                         ; ...
+        BGEQ      30$                              ; ...
+        MOVZBL    #100, R2                         ; ...
+30$:
+        MOVZWL    CPU$W_SANITY_TIMER(R3), R0       ; R = CPU$W_SANITY_TIMER - SGN$GW_SMP_TICK_CNT
+        MOVZWL    G^SGN$GW_SMP_TICK_CNT, -(SP)     ; ...
+        SUBL      (SP)+, R0                        ; ...
+        SUBL      R1, R0                           ; R -= RMAX
+        SUBL      R2, R0                           ; R -= SAFE_MARGIN
+        CMPL      R0, R1                           ; R = min(R, RMAX)
+        BLEQ      40$                              ; ...
+        MOVL      R1, R0                           ; ...
+40$:
+        TSTL      R0                               ; R = max(0, R)
+        BGEQ      50$                              ; ...
+        CLRL      R0                               ; ...
+50$:
+        POPL      R2                               ; restore scratch registers
+        POPL      R1                               ; ...
+        RSB                                        ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Check if dynamic patches can be applied.
+;
+;  Inputs:
+;      4(AP) = nopatch mask
+;      IPL = 31
+;
+;  Outputs:
+;      Status in R0.
+;      Sub-status in KERROR_CAUSE.
+;
+;-
+        .ENTRY    CHECK_PATCHES, ^M<>
+        .ENABLE   LOCAL_BLOCK
+        MOVL      #VSMP_MSG_LDR_SMP_JMPVEC, -    ; assume error
+                  KERROR_CAUSE                   ; ...
+        MOVAB     SMP_JMPVEC, R0                 ; check SMP vector first
+10$:
+        MOVL      (R0), R1                       ; get address of next vectored routine
+        BEQL      20$                            ; eql - end of list
+        CMPW      (R1), JMP_INSTR                ; check if JMP @#
+        BNEQ      100$                           ; neq - unexpected content
+        ADDL      #<3*4>, R0                     ; next vector
+        BRB       10$                            ; go check next entry in the table
+20$:
+        PUSHL     4(AP)                          ; check dynpatches
+        CALLS     #1, CHECK_DYNPATCHES           ; ...
+        MOVL      R0, KERROR_CAUSE               ; save error status
+        BLBC      R0, 100$                       ; lbc - take error exit
+        MOVZBL    #SS$_NORMAL, R0                ; sussessful return to the caller
+        RET                                      ; ...
+100$:
+        MOVL      #VSMP_MSG_LDR_VERIFY, R0       ; return error to the caller
+        RET                                      ; ...
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  Apply dynamic patches.
+;
+;  Inputs:
+;      4(AP) = nopatch mask
+;      IPL = 31
+;
+;-
+        .ENTRY    APPLY_PATCHES, ^M<R2>
+        .ENABLE   LOCAL_BLOCK
+        MOVAB     SMP_JMPVEC, R0                 ; apply SMP vector first
+10$:
+        MOVL      (R0)+, R1                      ; get address of next vectored routine
+        BEQL      30$                            ; eql - end of list
+        ;
+        ; see if "store old value" is present
+        ;
+        TSTL      4(R0)                          ; saving old vector address value requested?
+        BEQL      20$                            ; eql - no, skip
+        MOVAB     4(R0), R2                      ; address of save location
+        ADDL      (R2), R2                       ; ...
+        MOVL      2(R1), (R2)                    ; save old JMP@# vector transfer address
+20$:
+        ADDL3     R0, (R0), 2(R1)                ; address of replacement code in JMP @#
+        ADDL      #8, R0                         ; next vector
+        BRB       10$                            ; go check next entry in the table
+30$:
+        PUSHL     4(AP)                          ; apply dynpatches
+        CALLS     #1, APPLY_DYNPATCHES           ; ...
+        JSB       FLUSH_INSTRUCTION_STREAM       ; flush instructon stream after patching the code
+        RET
+        .DISABLE  LOCAL_BLOCK
+
+;+
+;
+;  FLUSH_INSTRUCTION_STREAM - after instruction patching
+;
+;-
+        .ENABLE   LOCAL_BLOCK
+FLUSH_INSTRUCTION_STREAM::
+        MOVPSL    -(SP)                          ; execute REI to flush instruction stream
+        MOVAB     10$, -(SP)                     ; ...
+        REI                                      ; ...
+10$:
+        RSB                                      ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+        .MACRO    JMPVEC SRC, DST, SAVE
+        .ADDRESS  SRC
+        .LONG     DST - .
+        .IF NB SAVE
+        .LONG     SAVE - .
+        .IFF
+        .LONG     0
+        .ENDC
+        .ENDM     JMPVEC
+
+        .ALIGN    LONG
+SMP_JMPVEC:
+        JMPVEC    EXE$INIPROCREG, VSMP$INIPROCREG
+        JMPVEC    SMP$INTPROC, VSMP$INTPROC
+        JMPVEC    SMP$INTALL, VSMP$INTALL
+        JMPVEC    SMP$INTALL_BIT, VSMP$INTALL_BIT
+        JMPVEC    SMP$INTALL_ACQ, VSMP$INTALL_ACQ
+        JMPVEC    SMP$INTALL_BIT_ACQ, VSMP$INTALL_BIT_ACQ
+        JMPVEC    SMP$SETUP_CPU, VSMP$SETUP_CPU
+        JMPVEC    SMP$SETUP_SMP, VSMP$SETUP_SMP
+        JMPVEC    SMP$START_CPU, VSMP$START_CPU
+        JMPVEC    SMP$STOP_CPU, VSMP$STOP_CPU
+        JMPVEC    SMP$SHOW_CPU, VSMP$SHOW_CPU
+        JMPVEC    SMP$HALT_CPU, VSMP$HALT_CPU
+        JMPVEC    SMP$CONTROLP_CPUS, VSMP$CONTROLP_CPUS
+        JMPVEC    SMP$INVALID_SINGLE, VSMP$INVALID_SINGLE
+        JMPVEC    SMP$VIRTCONS_SERVER, VSMP$VIRTCONS_SERVER
+        JMPVEC    SMP$SELECT_PRIMARY, VSMP$SELECT_PRIMARY
+        JMPVEC    EXE$READ_TODR, VSMP$READ_TODR
+        JMPVEC    EXE$WRITE_TODR, VSMP$WRITE_TODR
+        JMPVEC    CON$OWNCTY, VCON$OWNCTY
+        JMPVEC    CON$RELEASECTY, VCON$RELEASECTY
+        JMPVEC    CON$GETCHAR, VCON$GETCHAR, VCON$OLD_GETCHAR
+        JMPVEC    CON$PUTCHAR, VCON$PUTCHAR, VCON$OLD_PUTCHAR
+        .LONG     0  ;; end of vector list
+
+;;***********************************************************************************
+;;  End of kernel-resident part loaded into nonpaged memory
+;;***********************************************************************************
+
+;;  All KLOAD_DATA and KLOAD_CODE from all source files go into here
+
+        .PSECT    KLOAD_ZZZ QUAD, PIC, EXE, NOSHR, WRT
+KLOAD_END == . - 1                                 ; end of loadable code
+        .BLKB     1                                ; force the section to appear in the linker map
+
+;;***********************************************************************************
+;;  Ended kernel-resident part loaded into nonpaged memory
+;;***********************************************************************************
+
+        .END

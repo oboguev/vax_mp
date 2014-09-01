@@ -1,0 +1,930 @@
+        .TITLE    STARTCPU
+        .IDENT    /V1.00/
+
+;;
+;;  Kernel-mode loadable code for SIMH VMS virtual SMP utility.
+;;
+;;  SMP START CPU part
+;;
+;;  This module defines SMP-capable version of SMP$SETUP_CPU and SMP$START_CPU routines
+;;  that override uniprocessor version of those routines supplied by SYSLOA650. When VSMP is
+;;  activated, CPULOA vectors are changed to point to new routines instead of their SYSLOA650
+;;  versions.
+;;
+;;  Tested with OpenVMS VAX version 7.3.
+;;
+;;  Module:     startcpu.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev (oboguev@yahoo.com)
+;;  Created:    10-Dec-2011
+;;  Revision History:
+;;              none
+;;
+        .LIBRARY  "SYS$LIBRARY:LIB"
+
+        SYS_DEFS        ; common VMS definitions
+        $VPFLAGSDEF     ; vector processor flags
+
+        $PFNDEF         ; PFN array state codes
+        $PTEDEF         ; page table entry
+        $VADEF          ; virtual address break-up
+
+        $KA650DEF       ; KA650-specific definitions
+        $PR650DEF       ; ...
+
+        XBRANCH         ; Extended branch instructions
+        SIMHDEF         ; SIMH API definitions
+
+        CR = ^X0D
+        LF = ^X0A
+
+        RESTART_PWR_UP  = 3   ; powerup restart code (not really meaningful for KA650)
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- data
+;;***********************************************************************************
+
+        .PSECT    KLOAD_DATA QUAD, PIC, EXE, NOSHR, WRT
+;
+; Messages that may be issued when CPUs begin executing or fails to be started
+;
+BOOT_DONE:      .ASCIC  <CR><LF>\%SMP-I-CPUBOOTED, CPU #\
+BOOT_DONE2:     .ASCIC  \ has joined the PRIMARY CPU in multiprocessor operation\
+
+UNSTART_UNK:    .ASCIC  <CR><LF>\%SMP-E-UNSTART, Unable to start CPU #\
+UNSTART_UNK2:   .ASCIC  \ , error reason unidentified\
+
+UNSTART_CPUID:  .ASCIC  <CR><LF>\%SMP-E-UNSTART, Unable to start CPU #\
+UNSTART_CPUID2: .ASCIC  \ , CPU ID is not recognized by VAX MP\
+
+UNSTART_NRDY:   .ASCIC  <CR><LF>\%SMP-E-UNSTART, Unable to start CPU #\
+UNSTART_NRDY2:  .ASCIC  \ , CPU is not in VAX MP STANDBY state\
+
+UNSTART_IVREG:   .ASCIC  <CR><LF>\%SMP-E-UNSTART, Unable to start CPU #\
+UNSTART_IVREG2:  .ASCIC  \ , invalid startup HWPCB/SCBB/SBR/SLR/MAPEN values\
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- code
+;;***********************************************************************************
+
+        .PSECT    KLOAD_CODE QUAD, PIC, EXE, SHR, NOWRT
+;++
+;
+; EXE$INIPROCREG - perform initialization of interval timer and CPU-dependent registers
+;
+;     VSMP$INIPROCREG is vectored through JSB G^EXE$INIPROCREG.
+;
+;     INIPROCREG is called by the powerfail restart code for all CPUs that were members
+;     of the SMP active set prior to the powerfailure.
+;
+;     INIPROCREG is also called by START/CPU for secondary CPUs only.
+;
+; Inputs:
+;
+;       none
+;
+; Outputs:
+;
+;       none
+;-
+
+VSMP$INIPROCREG::
+        .ENABLE   LOCAL_BLOCK
+        MOVQ      R0, -(SP)                     ; save scratch registers
+        MOVL      G^EXE$GL_CPUNODSP, R0         ; get node-specific area address
+;
+;  enable or disable CRD interrupts, according to the CRD-enable flag
+;
+        EXTZV     S^#EXE$V_CRDENABLE, #1, -     ; get CRD-enable bit
+                  G^EXE$GB_CRD_CONTROL, R1      ; ...
+        INSV      R1,-                          ; insert CRD-enable bit to proper field
+                  #KA650$V_MEM17_CRDENB, #1, -  ; ...
+                  KA650$L_MEM17(R0)             ; ...
+;
+;  clear the reboot code in the console mailbox, for primary processor only
+;
+        MFPR      S^#PR$_CPUID, R1              ; get CPU node ID
+        CMPL      R1, G^SMP$GL_PRIMID           ; primary?
+        BNEQ      10$                           ; neq - secondary, skip NVR change
+        ASSUME    KA650$V_HALT_ACTION EQ 0
+        ASSUME    KA650$S_HALT_ACTION EQ 2
+        BICW      #3, KA650$B_NVR(R0)           ; clear reboot code in the console mailbox
+10$:
+;
+;  enable clock interrupts and clear processor-specific error registers
+;
+        MTPR      #^X40, S^#PR$_ICCS            ; enable clock interrupts
+        BSBB      EXE_CLEAR_ERRORS              ; clear processor-specific error registers
+        MOVQ      (SP)+, R0                     ; restore scratch registers
+        RSB                                     ; return
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; EXE_CLEAR_ERRORS
+;
+;     This routine is specific to the KA650 (Mayfair) processor, and clears all the KA650
+;     error flags. It replicates SYSLOA650 EXE$CLEAR_ERRORS with no functonal changes for
+;     multiprocessor case. The only reason we do not just call the original is because 
+;     EXE$CLEAR_ERRORS is not exposed as system vectored routine.
+;
+; Inputs:  
+;
+;       None
+;
+; Outputs: 
+;
+;       Mayfair error flags are cleared.
+;       All general-purpose register values are preserved.
+;       
+;--
+EXE_CLEAR_ERRORS::
+        MOVQ      R0, -(SP)               ; save scratch registers
+        MOVL      G^EXE$GL_CPUNODSP, R0   ; get node-specific area address
+
+        MFPR      #PR650$_MSER, R1        ; reinit MSER and clear errors
+        MTPR      R1,#PR650$_MSER         ; ...
+        MOVB      KA650$L_CACR(R0), -     ; reinit CACR and clear errors
+                  KA650$L_CACR(R0)        ; ... (can only write low byte of CACR)
+        MOVL      KA650$L_MEM16(R0), -    ; reinit MEMCSR16 and clear errors
+                  KA650$L_MEM16(R0)       ; ...
+        MOVL      KA650$L_CBTCR(R0), -    ; reinit CBTCR and clear errors
+                  KA650$L_CBTCR(R0)       ; ...
+        MOVL      KA650$L_DSER(R0), -     ; reinit DSER and clear QBus errors
+                  KA650$L_DSER(R0)        ; ...
+
+        MOVQ      (SP)+, R0               ; restore scratch registers
+        RSB
+
+
+;++
+;
+; SMP$START_CPU - CPU-specific kernel mode routine that was intended for DCL START /CPU command,
+;                 however this routine is not actually ever invoked
+;
+;--
+
+VSMP$START_CPU::
+        RSB
+
+
+;++
+;
+; SMP$SETUP_CPU - add designated CPU to the SMP enviornment
+;
+;     Called by START/CPU command to establish the context for the target CPU
+;     if it does not exist yet and bring the processor online as a member of 
+;     the multiprocessor system.
+;
+;     Current CPU is the primary CPU.
+;
+; Inputs: 
+;
+;     R9 = CPU ID of the processor being brought online
+;
+;     Caller IPL and state should be low enough to allow this routine to acquire
+;     MMG spninlock and, better yet, be at IPL 0 to ASTDEL. This routine can bugcheck
+;     if caller's IPL is above ASTDEL and there is no free memory pages allocatable
+;     (if caller's IPL is 0...ASTDEL, it will wait for memory to become available).
+;
+;     DCL START/CPU command invokes this routine at IPL 0.
+;
+; Outputs: 
+;
+;     R0 = SS$_WASSET - CPU already running
+;          SS$_BADPARAM - specified CPU is not available for booting
+;
+;     Other success/failure status codes may also be returned
+;
+;     Note however that R0 unfortunately cannot be used to pass meaningful status
+;     to be displayed by DCL START/CPU command: as long as SMP$SETUP_CPU returns 
+;     a failure status, any failure status, DCL START/CPU (SMPUTIL.MAR) will always
+;     convert it to SS$_NOSUCHCPU.
+;
+;     The only way to display a meaningful message is by printing it to console
+;     using SMP$WRITE_OPA0 or similar interface.
+;
+;--
+
+VSMP$SETUP_CPU::
+        .ENABLE   LOCAL_BLOCK
+        BBC       R9, G^SMP$GL_CPUCONF, 20$             ; bc - specified CPU does not exist
+        PUSHR     #^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>  ; save scratch registers
+        LOCK      LOCKNAME=MMG, -                       ; lock MMG data structures
+                  LOCKIPL=IPL$_SYNCH, -                 ; ...
+                  PRESERVE=NO, -                        ; ...
+                  SAVIPL=R7                             ; ...
+        ;
+        ;  see if per-CPU database already exists or it is the first reference to the processor
+        ;  and database has to be created
+        ;
+        MOVAL     G^SMP$GL_CPU_DATA, R1                 ; get address of per-CPU database
+        MOVL      (R1)[R9], R6                          ; ...
+        BEQL      30$                                   ; eql - none exists yet
+        CMPB      #CPU$C_INIT, -                        ; is CPU ready for restart?
+                  CPU$B_STATE(R6)                       ; ...
+        BNEQ      10$                                   ; neq - not ready, cannot restart it
+        XCCBI     R9, G^SMP$GL_BUG_DONE                 ; clear BUG DONE flag for this CPU
+        BRW       RESTART_CPU                           ; go restart this CPU
+10$:
+        MOVZBL    #SS$_WASSET, R0                       ; return success indicator "already started"
+15$:
+        UNLOCK    LOCKNAME=MMG, -                       ; release the lock
+                  PRESERVE=YES, -                       ; ...
+                  CONDITION=RESTORE, -                  ; ...
+                  NEWIPL=R7                             ;.. 
+        POPR      #^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>  ; restore scratch registers
+        RSB                                             ; return to the caller
+20$:
+        MOVZBL    #SS$_BADPARAM, R0                     ; return status for invalid CPU ID
+        RSB                                             ; ...
+30$:
+        XCCBI     R9, G^SMP$GL_BUG_DONE                 ; clear BUG_DONE flag for this CPU
+        BSBW      ALLOC_PER_CPU_DATA                    ; allocate per-CPU data area
+        BLBC      R0, 15$                               ; lbc - failed, return error status to the caller
+        BSBW      INIT_PER_CPU_DATA                     ; initialize per-CPU data area
+        MOVL      R6, G^SMP$GL_CPU_DATA[R9]             ; store VA of new per-CPU database in the system vector
+RESTART_CPU:
+        MFPR      #PR$_SCBB, CPU$L_SCBB(R6)             ; set SCB address in the CPU block
+        ;
+        ;  set up argument block for SIMH "START CPU" function
+        ;
+        SUBL      #<34*4>, SP                           ; space for the block
+        MOVL      SP, R0                                ; ...
+        MOVL      #VAXMP_API_SIGNATURE, (R0)+           ; signature code
+        MOVL      #VAXMP_API_OP_START_CPU, (R0)+        ; function code
+        MOVZBL    #1, (R0)+                             ; guest API version
+        CLRL      (R0)+                                 ; response status placeholder
+        MOVL      R9, (R0)+                             ; CPU ID
+        CLRQ      (R0)+                                 ; KSP, ESP = 0
+        CLRQ      (R0)+                                 ; SSP, USP = 0
+        CLRQ      (R0)+                                 ; R0, R1 = 0
+        CLRQ      (R0)+                                 ; R2, R3 = 0
+        CLRQ      (R0)+                                 ; R4, R5 = 0
+        CLRL      (R0)+                                 ; R6 = 0
+        MOVL      R6, (R0)+                             ; R7 = virtual address of per-CPU database
+        CLRQ      (R0)+                                 ; R8, R9 = 0
+        CLRQ      (R0)+                                 ; R10, R11 = 0
+        CLRQ      (R0)+                                 ; AP, FP = 0
+        MOVAB     CPU_START_VIRTUAL, (R0)+              ; PC
+        MOVL      #<PSL$M_IS!<IPL$_POWER@PSL$V_IPL>>, (R0)+  ;  PSL: IPL=31, Interrupt Stack
+        CLRL      (R0)+                                 ; P0BR = 0
+        MOVL      #<4@24>, (R0)+                        ; ASTLVL = 4, P0LR = 0
+        CLRL      (R0)+                                 ; P1BR = 0
+        CLRL      (R0)+                                 ; PME, P1LR = 0
+        MFPR      S^#PR$_SCBB, (R0)+                    ; SCBB to set
+        MOVZBL    #1, (R0)+                             ; MAPEN to set
+        MFPR      S^#PR$_SBR, (R0)+                     ; SBR to set
+        MFPR      S^#PR$_SLR, (R0)+                     ; SLR to set
+        MOVL      CPU$L_INTSTK(R6), (R0)+               ; ISP to set
+        MTPR      SP, #PR$_SIMH                         ; signal to SIMH
+        MOVL      12(SP), R0                            ; save SIMH response status code
+        ADDL      #<34*4>, SP                           ; remove request block off the stack
+        CASE      R0, <50$,51$,52$,53$,54$>, TYPE=L     ; dispatch on return status
+50$:
+        MOVAB     UNSTART_UNK, R1                       ; print message "error unknown"
+        MOVAB     UNSTART_UNK2, R2                      ; and return error status
+        BRB       70$                                   ; to caller
+51$:
+        MOVZBL    #SS$_NORMAL, R0                       ; successfully started CPU
+        BRW       15$                                   ; return success status to caller
+52$:
+        MOVAB     UNSTART_CPUID, R1                     ; print error message
+        MOVAB     UNSTART_CPUID2, R2                    ; "CPU ID rejected by VAX MP"
+        BRB       70$                                   ; and return error status to caller
+53$:
+        MOVAB     UNSTART_NRDY, R1                      ; print error message
+        MOVAB     UNSTART_NRDY2, R2                     ; "CPU is not in VAX MP STANDBY state"
+        BRB       70$                                   ; and return error status to caller
+54$:
+        MOVAB     UNSTART_IVREG, R1                     ; print error message
+        MOVAB     UNSTART_IVREG2, R2                    ; "invalid startup HWPCB/SCBB ... values"
+70$:
+        JSB       G^SMP$WRITE_OPA0                      ; print out the message
+        MOVZWL    #SS$_ABORT, R0                        ; return error status
+        BRW       15$                                   ; to the caller
+        .DISABLE LOCAL_BLOCK
+
+
+;+
+;
+;  ALLOC_PER_CPU_DATA - allocate virtual address range and memory pages for per-CPU data
+;
+;  Target CPU has never been previously booted into this incarnation of the system (since
+;  the system's last reboot) and its per-CPU data area does not exist yet. Allocate and
+;  initialize a per-CPU area for this CPU before starting it and requesting it
+;  to join the multiprocessing system. (Initialization is performed by separate call to
+;  INIT_PER_CPU_DATA.)
+;
+;  Allocate PFNs and SPTEs per-CPU data structures. Layout should look like this
+;  (high addresses at the top, lower addresses at the bottom):
+;
+;          +------------------------------------------------+
+;          |                                                |
+;          |                 Guard page                     |
+;          |                                                |
+;          |------------------------------------------------|
+;          |                                                |
+;          |              Interrupt stack                   |
+;          |           (SGN$GW_ISPPGCT pages)               |
+;          |                                                |
+;          |------------------------------------------------|
+;          |                                                |
+;          |                 Guard page                     |
+;          |                                                |
+;          |------------------------------------------------|
+;          |                                                |
+;          |               Boot stack page                  |
+;          |           (double-mapped via P0PT)             |
+;          |                                                |
+;          |------------------------------------------------|
+;          |                                                |
+;          |                  Guard page                    |
+;          |                                                |
+;          |------------------------------------------------|
+;          |                                                |
+;          |                 per-CPU DB                     |
+;          |            (CPU$C_PAGECNT pages)               |
+;          |                                                |
+;          +------------------------------------------------+  <-- aligned
+;
+;  The bottom of this structure must be aligned to a power of two address 
+;  as reflected in SMP$GL_BASE_MSK, which is used by FIND_CPU_DATA.
+;
+;  Under VAX MP we have a luxory of convenience to start CPU right off with virtual memory
+;  mapping enabled. This obviates the need for setting up and use of real-mode page table page,
+;  real-mode stack and related varables:
+;
+;      CPU$L_REALSTACK
+;      CPU$L_P0PT_PAGE
+;      SMP$GL_P0PT_MAP
+;
+;  They are still set but are not actually used under VAX MP.
+;
+;  This need is obviated for the purposes of starting/stopping processor during SMP management
+;  operation only. However these locations are also utilized when power failure restart is handled.
+;
+;  However neither VAX MP nor uniprocessor SIMH VAX currenly do not implement powerfail restarts
+;  (even for simulated uniprocessor VAX models), so the need is mute as well.
+;
+;  Furthermore, MicroVAX 3900 boot ROM is not SMP-aware and cannot supports SMP powerfailure restarts
+;  even if such capability were implemented by SIMH for uniprocessor models.
+;
+;  Furthermore, if we wished to implement powerfail restarts, there is an issue of VAX 3900 CDG 
+;  (cache diagnostic) space overlapping extended memory range when expanded 512 MB SIMH VAX memory mode
+;  is used, so this issue would have to be addressed (presumably either by disabling cache reinitialization
+;  by OpenVMS during the restarts and also intercepting console ROM CDG access and voiding it during
+;  the restart -- or perhaps simply by taking PFNs in the overlapped/conflicting range off the PFN
+;  free list during bootstrap).
+;
+;  Thus if powerfailure recovery support was ever implemented for SIMH VAX and VAX MP in the future,
+;  these issues would have to be addressed, and use of P0PT setup can be addresses as well at that time.
+;
+;  Inputs:
+;
+;      MMG spinlock is held
+;      R7 = caller caller's IPL
+;      R9 = CPU ID
+;
+;  Outputs:
+;
+;      R0 = status
+;      R6 = (if LBS R0) base virtual addreess of allocated per-CPU area, with proper alignment
+;      R11 = (if LBS R0) total page count in the area
+;      destroys R0-R5, R8, R10
+;
+;-
+        .ENABLE   LOCAL_BLOCK
+ALLOC_PER_CPU_DATA:
+        ;
+        ;  calculate R11 = actual page count for per-CPU area
+        ;
+        MOVZWL    G^SGN$GW_ISPPGCT, R11                 ; size of interrupt stack plus ...
+        ADDL      #<CPU$C_PAGECNT+3+1>, R11             ; ... per-CPU page count + 3 guard pages + 1 boot stack page
+        ;
+        ;  Calculate per-CPU area base mask implied by this page count.
+        ;  For this, calculate R2 = next higher power of 2 value (just above R11), i.e.
+        ;  value that will round down to base of per-CPU data area.
+        ;
+        MOVZBL    S^#8, R2                              ; initial power of 2 (start with 8 pages as the minimum)
+10$:
+        CMPL      R2, R11                               ; will per-CPU area fit into that number of virtual pages?
+        BGEQU     50$                                   ; br if will fit
+        ASHL      S^#1, R2, R2                          ; next power of 2
+        CMPL      R2, #^X10000                          ; number of pages way too high?
+        BLEQU     10$                                   ; br if not too high yet
+30$:
+        BUG_CHECK INCONSTATE, FATAL                     ; crash if insane interrupt stack size or mask mismatch
+50$:    
+        PUSHL     R2                                    ; save page count
+        ASHL      #VA$V_VPG, R2, R2                     ; convert to byte count
+        DECL      R2                                    ; get modulo number
+        CMPL      R2, G^SMP$GL_BASE_MSK                 ; compare with pre-calculated base mask
+        BNEQ      30$                                   ; neq - miscalculated granularity
+        POPL      R2                                    ; get back page count
+;
+;  At this point
+;
+;       R11  =  size (page count) of per-CPU database entry
+;       R2   =  R11 rounded up to the next higher power of 2
+;
+;  Preallocate (2 * R2 - 1) SPTEs to ensure we can achieve the alignment of the structure being created,
+;  regardless of the alignment of the allocated virtual space.
+;
+;  Calculate R4 = SPTE alignment mask = (4 * rounded-up page count) - 1
+;  Calculate R2 = number of SPTEs to allocate = (2 * rounded-up page count) - 1
+;
+        ASHL      S^#2, R2, R4                          ; SPTE bytes for rounded-up page count
+        DECL      R4                                    ; SPTE alignment bitmask
+        ASHL      S^#1, R2, R2                          ; calculate number of SPTEs to allocate
+        DECL      R2                                    ; ...
+;
+;  If VBSS is enabled, count in SPTEs required for VBSS
+;
+        BLBC      G^MMG$GB_VBSS_ENABLE, 60$             ; skip if VBSS is disabled
+        ADDL      #CPU$K_VBS_SPTES, R2                  ; count in SPTEs needed for VBSS
+60$:    
+        JSB       G^LDR$ALLOC_PT                        ; allocate required SPTEs
+        BLBS      R0, 70$                               ; br if success
+        RSB                                             ; SPTE allocation failed, return error to the caller
+70$:
+;
+;  We have allocated a range of system virtual address space of sufficient size to hold per-CPU database
+;  area aligned within this rage at required alignment. Perform per-CPU area alignment now, i.e. calculate
+;  base location for per-CPU area within the allocated virtual address space. Sections of virtual address
+;  space  left over below or above the new per-CPU area are unused and can be released back to the system.
+;
+;  At this point:
+;
+;       R1  =  starting address of allocated array of SPTEs
+;       R2  =  number of requested (and allocated) SPTEs (including VBSS window)
+;       R4  =  SPTE alignment mask
+;       R11 =  count of pages actually needed for per-CPU area (excluding VBSS window)
+;
+;  Calculate R4 = address of per-CPU area's SPTEs = (R1 + R4) & ~R4
+;
+        ADDL3     R1, R4, R3                            ; compute base SVA of SPTE block to map per-CPU area
+        BICL3     R4, R3, R4                            ; ...
+;
+;  Calculate R5 = number of excess SPTEs allocated that should now be released
+;
+        SUBL3     R11, R2, R5                           ; number of excess allocated SPTEs to release
+;
+;  At this point:
+;
+;       R1  =  starting address of the whole allocated array of SPTEs
+;       R2  =  total number of allocated SPTEs (including VBSS window)
+;       R4  =  base address of aligned SPTEs block that will map per-CPU area
+;       R5  =  number of excess SPTEs to release
+;       R11 =  count of pages actually needed for per-CPU area (excluding VBSS window)
+;
+;  Release excess SPTEs, section below per-CPU area.
+;
+        SUBL3     R1, R4, R2                            ; unused SPTE bytes below per-CPU area
+        DIVL      #4, R2                                ; convert to virtual page (SPTEs) count
+        SUBL      R2, R5                                ; unused virtual page (SPTEs) count above per-CPU area
+        JSB       G^LDR$DEALLOC_PT                      ; release unused bottom SPTEs back to the system
+;
+;  Release excess SPTEs, section above per-CPU area.
+;
+        ASHL      S^#2, R11, R1                         ; R1 = starting address of SPTEs to be released
+        ADDL      R4, R1                                ; ... (just above per-CPU area SPTEs)
+        MOVL      R5, R2                                ; SPTE count to release
+        JSB       G^LDR$DEALLOC_PT                      ; release unused top SPTEs back to the system, 
+                                                        ; including excess SPTEs allocated for VBSS window
+;
+;  We have allocated virtual address space for per-CPU database, including SPTEs for per-CPU area itself,
+;  interrupt stack, boot stack and stack guard pages. Now allocate physical pages for them and map virtual
+;  pages to physical.
+;
+;  In case of KA650 based VAX MP we can allocate these pages anywhere in the machine's physical memory.
+;
+;  However just in case if VAX MP ever in the future implements emulation of higher-end CPUs, physical pages
+;  for the first page of per-CPU database and boot stack page must be allocated from low 512 MB of physical memory
+;  since these two pages may be accessed by by the code executing with memory management disabled. When memory management
+;  is disabled, on machines with 30-bit physical address mode only low 1 GB or memory is accessible (see
+;  "VAX Architecture Reference Manual" 2nd ed., section 4.2.1 "Memory management disabled"). OpenVMS does not
+;  have a routine to allocate from low 1 GB, however it has routine (MMG$ALLOCPFN_LOW) to allocate from low
+;  512 MB which we are using below.
+;
+;  Note that none of this is applicable to KA650 which is limited to 512 MB anyway even in expanded version.
+;
+;  Furthermore, low-memory allocation is required only in two cases, none of which currently applies:
+;
+;      (1) Powerfail restart, which SIMH/VAX MP currently does not implement.
+; or 
+;
+;      (2) Starting secondary CPUs initially with MAPEN=0 instead of starting them in virtual mode.
+;          Currently VSMP starts secondary processors in virtual mode right away (MAPEN=1).
+;
+;  All other pages for per-CPU data area, including the interrupt stack pages and per-CPU DB pages except
+;  the first one, may be allocated from any part of memory in any event.
+;
+;       R4  =  SPTE address mapping the start of per-CPU area
+;       R11 =  number of pages (SPTEs) in the whole per-CPU area, 
+;              including CPU DB, boot stack, interrupt stack and three guard pages
+;       R7  =  VSMP$SETUP_CPU caller's IPL
+;       R9  =  CPU ID for the target processor
+;
+        SUBL3     G^LDR$GL_SPTBASE, R4, R1              ; byte offset in SPT to starting per-CPU ares's SPTE
+        MULL      #<512/4>, R1                          ; convert to offset from the base of S0 space
+        BISL3     #VA$M_SYSTEM, R1, R10                 ; SVA of per-CPU area base
+        BSBW      ALLOC_PHY_PAGE_LOW                    ; allocate physical page for first CPU DB page (use low 512 MB)
+        MOVL      R10, R2                               ; set up virtual address for INVALIDATE_TB
+        MOVZBL    #CPU$C_PAGECNT, R3                    ; number of pages in per-CPU database
+        BRB       90$                                   ; enter loop to map the page and then map the remainder of per-CPU DB
+80$:    BSBW      ALLOC_PHY_PAGE                        ; allocate physical memory page (from any part of memory)
+        ;
+        ;  Map the new per-CPU database pages.
+        ;
+        ;  Also invalidate TLB for the allocated page. The latter is likely to be redundant
+        ;  since pages corresponding to "available" SPTEs must have been set "invalid" earlier 
+        ;  and thus had been flushed from the TLBs, but just to be on the safe side...
+        ;
+90$:    INVALIDATE_TB R2, -                             ; change PTE and invalidate TLB entries
+                  INST1=<BISL3 #<PTE$C_URKW!PTE$M_VALID!PTE$M_MODIFY!PTE$C_KOWN>,R0,(R4)+>
+        ADDL      #512, R2                              ; advance to next page address
+        SOBGTR    R3, 80$                               ; loop until all per-CPU DB pages are done
+        ;
+        ;  Bottom (stack-top, stack overflow) guard page for boot stack
+        ;
+        INVALIDATE_TB R2, -                             ; change PTE and invalidate TLB entry
+                  INST1=<CLRL (R4)+>                    ; ...
+        ADDL      #512, R2                              ; advance to next page address
+        ;
+        ;  Boot stack page
+        ;
+        BSBW      ALLOC_PHY_PAGE_LOW                    ; allocate physical page (from low 512 MB)
+        INVALIDATE_TB R2, -                             ; change PTE and invalidate TLB entry
+                  INST1=<BISL3 #<PTE$C_ERKW!PTE$M_VALID!PTE$M_MODIFY!PTE$C_KOWN>,R0,(R4)+>
+        ADDL      #512, R2                              ; advance to next page address
+        ;
+        ;  Dual-map boot stack page so that it can also be used as a temporary P0 page table
+        ;  page. It needs to be mapped at a high SVA to guarantee that entire P0 page table will
+        ;  be within S0 space while memory management is being enabled.
+        ;
+        ;  Again, this is not currenly relevant for VAX MP but may become relevant if code that
+        ;  executes with memory management disabled is ever enabled, as had been discussed above.
+        ;
+        ;  SMP$GL_P0PT_MAP points to an array of virtual pages used as P0 page table pages when
+        ;  memory management is being enabling. This array holds a page per each CPU.
+        ;  These virtual pages dual-map each CPU's boot stack page located in its per-CPU area.
+        ;
+        ;  Note also that SYSBOOT reserves one SPTE for each of CPU$C_MAX_CPUS potential processors,
+        ;  regardless of whether the processor is present at boot time or not.
+        ;
+        ASHL      #VA$V_VPG, R9, R1                     ; calculate virtual address of P0PT page
+        ADDL      G^SMP$GL_P0PT_MAP, R1                 ; ...
+        EXTZV     #VA$V_SVPN, #VA$S_SVPN, R1, R0        ; SPTE index of P0PT page (index of the page in S0 region)
+        MOVL      G^LDR$GL_SPTBASE, R3                  ; SPT base address
+        INVALIDATE_TB R1, -                             ; change PTE and invalidate TLB entry
+                  INST1=<BISL3 #PTE$M_WINDOW,-4(R4),(R3)[R0]>
+        ;
+        ;  Bottom (stack-top, stack overflow) guard page for interrupt stack
+        ;
+        INVALIDATE_TB R2, -                             ; change PTE and invalidate TLB entry
+                  INST1=<CLRL (R4)+>                    ; ...
+        ADDL      #512, R2                              ; advance to next page address
+        ;
+        ;  Interrupt stack pages
+        ;
+        MOVZWL    G^SGN$GW_ISPPGCT, R3                  ; page count for interrupt stack
+100$:   
+        BSBW      ALLOC_PHY_PAGE                        ; allocate physical page
+        INVALIDATE_TB R2, -                             ; change PTE and invalidate TLB entries
+                  INST1=<BISL3 #<PTE$C_ERKW!PTE$M_VALID!PTE$M_MODIFY!PTE$C_KOWN>,R0,(R4)+>
+        ADDL      #512, R2                              ; advance to next page address
+        SOBGTR    R3, 100$                              ; loop until interrupt stack is done
+        ;
+        ;  Top (stack underrun) guard page for interrupt stack
+        ;
+        INVALIDATE_TB R2, -                             ; change PTE and invalidate TLB entries
+                  INST1=<CLRL (R4)>                     ; ...
+        ;
+        ;  Successful return to the caller  
+        ;
+        MOVL      R10, R6                               ; base virtual address of allocated per-CPU data area
+        MOVZBL    #SS$_NORMAL, R0                       ; return success status
+        RSB                                             ; to the caller
+        .DISABLE LOCAL_BLOCK
+
+
+;+
+;
+;  INIT_PER_CPU_DATA - initialize new per-CPU data area after allocation
+;
+;  Inputs:
+;
+;      MMG spinlock is held
+;      R6 = base virtual addreess of allocated per-CPU area, with proper alignment
+;      R7 = caller caller's IPL
+;      R9 = CPU ID
+;
+;  Outputs:
+;
+;      destroys R0-R5
+;
+;-
+        .ENABLE  LOCAL_BLOCK
+INIT_PER_CPU_DATA:
+        MOVC5     #0, (SP), #0, #CPU$C_LENGTH, (R6)     ; zero out the whole per-CPU DB area
+        ASSUME    CPU$W_SIZE+2 EQ CPU$B_TYPE
+        ASSUME    CPU$B_TYPE+1 EQ CPU$B_SUBTYPE
+        MOVL      #<<DYN$C_MP_CPU@24>!<DYN$C_MP@16>!CPU$C_LENGTH>, -
+                  CPU$W_SIZE(R6)                        ; initialize the structure header
+
+        MOVL      R6, CPU$L_PERCPUVA(R6)                ; store own virtual address
+        MOVB      #CPU$C_INIT, CPU$B_STATE(R6)          ; set initial state of this CPU
+
+        MOVL      R9, CPU$L_PHY_CPUID(R6)               ; store CPU ID
+        ASHL      R9, #1, CPU$L_CPUID_MASK(R6)          ; store CPU ID as bitmask
+
+        MOVL      #RESTART_PWR_UP, CPU$L_SAVED_AP(R6)   ; set restart code = POWERUP
+                                                        ; (not really meaningful for KA650)
+        MOVL      #BUG$_CPUCEASED, CPU$L_BUGCODE(R6)    ; init BUGCHECK code
+        MOVL      G^SCH$AR_NULLPCB, CPU$L_CURPCB(R6)    ; current PCB = NULL process
+
+        MOVL      G^EXE$GL_TENUSEC, CPU$L_TENUSEC(R6)   ; set busywait loop calibration counters
+        MOVL      G^EXE$GL_UBDELAY, CPU$L_UBDELAY(R6)   ; ...
+
+        MOVAB     CPU$L_PSFL(R6), CPU$L_PSFL(R6)        ; init IOPOST queue
+        MOVAB     CPU$L_PSFL(R6), CPU$L_PSBL(R6)        ; ...
+
+        MOVZBL    #CPU$K_NUM_SWIQS, R1                  ; number of fork queues to initialize
+        MOVAB     CPU$Q_SWIQFL(R6), R0                  ; address of first fork queue
+10$:    
+        MOVL      R0, (R0)                              ; initialize the queue
+        MOVL      R0, 4(R0)                             ; ...
+        ADDL      #8, R0                                ; advance to next queue
+        SOBGTR    R1, 10$                               ; loop to init next queue
+
+        ASHL      #VA$V_VPG, R9, CPU$L_P0PT_PAGE(R6)      ; virtual address of P0PT page
+        ADDL      G^SMP$GL_P0PT_MAP, CPU$L_P0PT_PAGE(R6)  ; ...
+
+        MOVZWL    G^SGN$GW_ISPPGCT, R0                  ; page count for interrupt stack
+        ASHL      #VA$V_VPG, R0, R0                     ; byte size of interrupt stack
+        ADDL3     #<CPU$C_STACK + 512>, R6, R1          ; address of the top of interrupt stack
+        ADDL3     R1, R0, CPU$L_INTSTK(R6)              ; address of the base of interrupt stack
+
+        ADDL3     #<CPU$C_STACK - 1>, R6, R0            ; address inside the boot stack
+        EXTZV     #VA$V_SVPN, #VA$S_SVPN, R0, R0        ; SVPN of the boot stack page
+        MOVL      G^LDR$GL_SPTBASE, R1                  ; SPT base address
+        MOVL      (R1)[R0], R0                          ; SPTE of the boot stack page
+        EXTZV     #PTE$V_PFN, #PTE$S_PFN, R0, R0        ; PFN of the boot stack page
+        ASHL      #VA$V_VPG, R0, R0                     ; physical address of the boot stack page
+        ADDL3     #512, R0, CPU$L_REALSTACK(R6)         ; stack pointer of empty boot stack
+;
+;  Initialize per CPU reserved SPTEs and SVAs for VBSS. We are "almost" certain of being able to
+;  allocate needed SPTEs by earlier successfull allocation and subsequent deallocation of required number
+;  of SPTEs in ALLOC_PER_CPU_DATA, so released SPTEs most likely should be still available. However since
+;  we may have released MMG lock in ALLOC_PHY_PAGE/WAIT_FREE_PAGE, when allocating memory pages for per-CPU
+;  data area, there is a small chance that these SPTEs may be gone and we may crash here. May want do redo
+;  the code later so SPTEs initially allocated for VBSS are not released in the first place.
+;
+        BLBC      G^MMG$GB_VBSS_ENABLE, 40$             ; skip if VBSS is not enabled
+        MOVL      #1,R2                                 ; allocate one SPTE
+        JSB       G^LDR$ALLOC_PT                        ; ...
+        BLBS      R0,20$                                ; lbs - allocation success
+        BUG_CHECK INCONSTATE, FATAL                     ; crash if unable to obtain the SPTE
+20$:    
+        MOVL      R1, CPU$L_VBS_CP_SPTE(R6)             ; store SVA of allocated SPTE
+        SUBL3     G^LDR$GL_SPTBASE, R1, R0              ; byte offset into SPT for this SPTE
+        ASHL      #<VA$V_SVPN-2>, R0, R0                ; SVA mapped by allocated SPTE
+        BISL3     #VA$M_SYSTEM, R0, -                   ; ...
+                  CPU$L_VBS_CP_SVA(R6)                  ; store computed mapped SVA 
+        ;
+        ; SPTEs for mapping VBS page
+        ;
+        MOVL      #2, R2                                ; allocate two contiguous SPTEs
+        JSB       G^LDR$ALLOC_PT                        ; ...
+        BLBS      R0, 30$                               ; lbs - allocation success
+        BUG_CHECK INCONSTATE, FATAL                     ; crash if was unable to obtain the SPTEs
+30$:    
+        MOVL      R1, CPU$L_VBS_MAP_SPTE(R6)            ; store SVA of first allocated SPTE
+        SUBL3     G^LDR$GL_SPTBASE, R1, R0              ; byte offset into SPT for first SPTE
+        ASHL      #<VA$V_SVPN-2>, R0, R0                ; SVA mapped by this SPTE
+        BISL3     #VA$M_SYSTEM, R0, -                   ; ...
+                  CPU$L_VBS_MAP_SVA(R6)                 ; store starting mapped SVA 
+40$:
+        RSB                                             ; return to the caller
+        .DISABLE LOCAL_BLOCK
+
+
+;+
+;
+; ALLOC_PHY_PAGE - Allocate PFN (physical page)
+; ALLOC_PHY_PAGE_LOW - Allocate PFN (physical page) from low 512 MB of memory
+;
+;     This routine will wait if a page is not immediatelly available and if top caller's IPL
+;     (as passed in R7) is not above ASTDEL. Otherwise it will generate a bugcheck.
+;
+; Inputs:
+;
+;       MMG spinlock is held
+;       R4 = SVA of PTE that will map the page to be allocated
+;       R7 = caller's original IPL before acquisition of MMG
+;
+; Outputs:
+;
+;       R0 = allocated PFN
+;       All other registers are preserved
+;
+;-
+
+        .ENABLE   LOCAL_BLOCK
+ALLOC_PHY_PAGE:
+        PUSHR     #^M<R1,R2,R3,R4,R5,R8>                ; preserve working registers
+        CLRL      R8                                    ; 0 = performing ALLOC_PHY_PAGE
+ALLOC_PHY_PAGE_REENTER:
+        JSB       G^MMG$ALLOCPFN                        ; try to allocate a page
+        BLSS      20$                                   ; lss - no free pages available now
+        BRB       10$                                   ; join common code
+
+ALLOC_PHY_PAGE_LOW:
+        PUSHR     #^M<R1,R2,R3,R4,R5,R8>                ; preserve working registers
+        MOVZBL    #1, R8                                ; 1 = performing ALLOC_PHY_PAGE_LOW
+ALLOC_PHY_PAGE_LOW_REENTER:
+        JSB       G^MMG$ALLOCPFN_LOW                    ; try to allocate a page
+        BLSS      20$                                   ; lss - no free pages available now   
+10$:    
+        CMPL      R0, G^MMG$GL_MAXPFN                   ; is this page in PFN database?
+        BGTR      15$                                   ; gtr - no, not in PFN database
+        DECL      G^PFN$GL_PHYPGCNT                     ; decrement remaning fluid page count
+        MOVL      G^PFN$AW_REFCNT, R2                   ; increment page reference count
+        INCW      (R2)[R0]                              ; ...
+        MOVL      G^PFN$AB_TYPE, R2                     ; page type = SYSTEM
+        MOVB      #PFN$C_SYSTEM, (R2)[R0]               ; ...
+        MOVL      G^PFN$AB_STATE, R2                    ; page state = ACTIVE
+        MOVB      #PFN$C_ACTIVE, (R2)[R0]               ; ...
+        MOVL      G^PFN$AL_PTE, R2                      ; store PTE back pointer
+        MOVL      R4,(R2)[R0]                           ; ...
+15$:     
+        POPR      #^M<R1,R2,R3,R4,R5,R8>                ; restore working registers
+        RSB                                             ; success, return the allocated page
+20$:    
+        CMPL      R7, #IPL$_ASTDEL                      ; can we wait for a page to be freed by another process?
+        BLEQU     WAIT_FREE_PAGE                        ; leq - yes, wait for free page
+        BUG_CHECK INCONSTATE, FATAL                     ; unable to enter wait state: caller's original IPL was too high
+;
+;  Wait for free page to become available
+;
+WAIT_FREE_PAGE:
+        LOCK      LOCKNAME=SCHED, -                     ; lock the scheduler database
+                  PRESERVE=NO, -                        ; ...
+                  LOCKIPL=#IPL$_SYNCH                   ; ...
+        MOVAQ     G^SCH$GQ_FPGWQ, R0                    ; we will be waiting on free page wait queue
+        MOVL      G^CTL$GL_PCB, R4                      ; current PCB address
+        JSB       G^MMG$PGFLTWAIT                       ; enter calling process in free page wait state
+        MOVPSL    -(SP)                                 ; build waiting PSL
+        INSV      #IPL$_ASTDEL, -                       ; process will be waiting at IPL=ASTDEL
+                  #PSL$V_IPL, #PSL$S_IPL, (SP)          ; ...
+        JSB       G^MMG$SVPCTX                          ; enter wait state and invoke the scheduler
+;
+;  At this point the calling process is placed in FPG wait state and the scheduler is invoked
+;  to select another process for execution.
+;
+;  Note that MMG$SVPCTX will release MMG and SCHED spinlocks.
+;
+;  Execution will be resumed below when a free page or pages have become available.
+;  Resuming at IPL = ASTDEL, and with no spinlocks held.
+;
+        LOCK      LOCKNAME=MMG, -                       ; reacquire MMG spinlock the caller held
+                  LOCKIPL=#IPL$_SYNCH, -                ; ...
+                  PRESERVE=NO                           ; ...
+        TSTL      R8                                    ; check which function was called
+        XBEQL     ALLOC_PHY_PAGE_REENTER                ; eql - branch back inside ALLOC_PHY_PAGE
+        BRW       ALLOC_PHY_PAGE_LOW_REENTER            ; else branch back inside ALLOC_PHY_PAGE_LOW
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; CPU_START_VIRTUAL - new CPU receives control here
+;
+; Inputs:
+;
+;     PSL: IPL=31, Interrupt Stack
+;     MAPEN = 1
+;     SBR, SLR and SCBB same as on initiator processor
+;     R7 = virtual address of per-CPU database
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+CPU_START_VIRTUAL:
+        MTPR      #1, #PR$_TBIA                  ; clear TLB cache
+        MOVL      CPU$L_INTSTK(R7), SP           ; load interrupt stack
+        MTPR      R7, S^#PR$_WHAMI               ; store address of CPU$
+        MFPR      S^#PR$_SID, CPU$L_SID(R7)      ; store SID
+        CLRL      CPU$L_WORK_REQ(R7)             ; clear IPI work request mask
+        ;
+        ;  Temporarily join the override set while the processor is being initialized
+        ;
+        XSSBI     CPU$L_PHY_CPUID(R7), -         ; list as a member of override set
+                  G^SMP$GL_OVERRIDE              ; ...
+        READ_SYSTIME CPU$Q_BOOT_TIME(R7)         ; record boot time
+        JSB       G^EXE$INIPROCREG               ; execute processor type specific initialization
+        MOVB      #CPU$C_BOOTED, CPU$B_STATE(R7) ; CPU now is in BOOTED state
+        ;
+        ;  wait for multiprocessing "go" bit
+        ;  (set after INIT or POWERFAIL completion by the primary)
+        ;  under VAX MP, this is essentially just a placeholder
+        ;
+10$:    BBC       #SMP$V_START_CPU, G^SMP$GL_FLAGS, 10$
+        ;
+        ;  send message to console about successfull booting
+        ;
+        MOVAB     W^BOOT_DONE, R1                ; first part of the message
+        MOVAB     W^BOOT_DONE2, R2               ; second part of the message
+        MOVL      R7, R6                         ; CPU DB address
+        JSB       G^SMP$WRITE_OPA0               ; Print out the message
+        ;
+        ;  If repeat powerfail is pending, let it happen here.
+        ;  Since VAX MP does not implement power failure simulation,
+        ;  under VAX MP this is essentially just a placeholder.
+        ;
+        SETIPL    #<IPL$_POWER-2>, -             ; allow pending powerfail interrupts
+                  ENVIRON=UNIPROCESSOR           ; to occur before we join the active set
+        NOP                                      ; ...
+        NOP                                      ; ...
+        SETIPL    #IPL$_POWER, -                 ; disable all interrupts again
+                  ENVIRON=UNIPROCESSOR           ; ... while we are joining multiprocessing system
+;
+;  Transition this CPU into active set.
+;
+;  Note: XDelta cannot be used in the section of code below while CPU mutex is held.
+;  No breakpoints in here, no stepping through this section.
+;
+        LOCK      MUTEX=SMP$GL_CPU_MUTEX, -      ; Lock CPU mutex while changing CPU state to active
+                  SHARE=NO, -                    ; ...
+                  PRESERVE=NO                    ; ...
+        MOVB      #CPU$C_RUN, CPU$B_STATE(R7)    ; CPU is now going into RUNNING state
+        XSSBI     CPU$L_PHY_CPUID(R7), -         ; join active set
+                  G^SMP$GL_ACTIVE_CPUS           ; ...
+        MOVL      R7, R2                         ; initialize CPU sanity timer fields
+        JSB       G^SMP$INIT_SANITY              ; ...
+        UNLOCK    MUTEX=SMP$GL_CPU_MUTEX, -      ; release CPU mutex
+                  SHARE=NO, -                    ; ...
+                  PRESERVE=NO                    ; ...
+;
+;  XDelta can be used again.
+;
+        XDELTA_WAIT                              ; if XDELTA is active, temporarily enter bening state
+        ;
+        ;  Set CPU initial capabilities to default
+        ;
+        LOCK      LOCKNAME=SCHED, -              ; acquire SCHED lock
+                  PRESERVE=NO                    ; ...
+        CLRL      -(SP)                          ; do not need previous value to be returned
+        PUSHL     G^SCH$GL_DEFAULT_CPU_CAP       ; use default capabilities
+        PUSHL     CPU$L_PHY_CPUID(R7)            ; current CPU ID
+        CALLS     #3, G^SCH$ADD_CPU_CAP          ; set up initial capabilities
+        UNLOCK    LOCKNAME=SCHED, -              ; release SCHED lock
+                  PRESERVE=NO                    ; ...
+        ;
+        ;  Remove this CPU from the override set.
+        ;  Spinlock acquire and release requests will be now subject to checks.
+        ;
+        XCCBI     CPU$L_PHY_CPUID(R7), -
+                  G^SMP$GL_OVERRIDE
+        ;
+        ;  Mark this CPU as idle
+        ;
+        XSSBI     CPU$L_PHY_CPUID(R7), -
+                  G^SCH$GL_IDLE_CPUS
+        ;
+        ;  Lower IPL to SYNCH
+        ;
+        PUSHL     #<PSL$M_IS!<IPL$_SYNCH@PSL$V_IPL>>
+        PUSHAB    B^100$
+        REI
+100$:   
+        ;
+        ;  Send dummy IPI request to other CPUs to ensure active set mask change had been propagated 
+        ;  to them and other processors start considering this one a member of the active set. 
+        ;
+        ;  Sending and receiving IPI request makes mutually coupled memory barriers to be executed 
+        ;  and mask changes propagated across the multiprocessor system. By the time IP_ACK_WAIT
+        ;  completes we'll know the update to masks had been propagated and is visible to all processors
+        ;  in a multiprocessor system.
+        ;
+        ;  An easy way may be to do IP_ACK_WAIT PING, however spin loops in VSMP$INTSR, 
+        ;  VSMP$VIRTCONS_SERVER and, most importantly, in SMP$ACQUIRE/SMP$ACQUIREL/SMP$ACQNOIPL 
+        ;  are not set up to process PING. They are currently set up only to procss INV_TBS. 
+        ;
+        ;  Therefore send out dummy INV_TBS. We do this by executing INVALIDATE_TB.
+        ;  We could use any system space address for INVALIDATE_TB. Per-CPU DB address is as
+        ;  good as any.
+        ;
+        FIND_CPU_DATA   R2                       ; use per-CPU CPU database address for INVALIDATE_TB
+        INVALIDATE_TB   R2, INST1=<NOP>          ; INVALIDATE_TB internally executes IP_ACK_WAIT INV_TBS
+
+        ;
+        ;  Transfer control to the scheduler to join the VMS multiprocessing system
+        ;
+        FIND_CPU_DATA   R2                       ; get per-CPU CPU database address in R2 for SCH$SCHED
+                                                 ; (required for earlier versions of OpenVMS, but not for 7.3)
+        JMP       G^SCH$SCHED                    ; transfer this CPU's control to the scheduler
+        .DISABLE  LOCAL_BLOCK
+
+        .END

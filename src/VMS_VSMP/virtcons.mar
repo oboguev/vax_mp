@@ -1,0 +1,561 @@
+        .TITLE    VIRTCONS
+        .IDENT    /V1.00/
+
+;;
+;;  Kernel-mode loadable code for SIMH VMS virtual SMP utility.
+;;  Virtual console part -- provide replacement of SMP-related CON$xxx routines supplied by SYSLOA.
+;;
+;;  This module defines SMP-capable version of CON$xxx and other vitual console related routines 
+;;  that override uniprocessor version of those routine supplied by SYSLOA650 (and defined in
+;;  [SYSLOA.SRC]OPDRIVER.MAR). When VSMP is activated, CPULOA vectors are changed to point to new
+;   routines instead of their SYSLOA650 version.
+;;
+;;  Tested with OpenVMS VAX version 7.3.
+;;
+;;  Module:     virtcons.mar
+;;  Version:    1.0
+;;  Author:     Sergey Oboguev (oboguev@yahoo.com)
+;;  Created:    16-Dec-2011
+;;  Revision History:
+;;              none
+;;
+        .LIBRARY  "SYS$LIBRARY:LIB"
+
+        SYS_DEFS        ; common VMS definitions
+        $VPFLAGSDEF     ; vector processor flags
+
+        XBRANCH         ; Extended branch instructions
+        SIMHDEF         ; SIMH API definitions
+
+        .MACRO    DO_SET  VAR
+        XSSBI     #0, VAR
+        .ENDM     DO_SET
+
+        .MACRO    DO_CLR  VAR
+        XCCBI     #0, VAR
+        .ENDM     DO_CLR
+
+        .MACRO    IF_SET VAR, L
+        ADAWI     #0, VAR             ; non-interlocked version would be
+        BNEQ      L                   ; BLBS VAR, L
+        .ENDM     IF_SET
+
+        .MACRO    IF_CLR VAR, L
+        ADAWI     #0, VAR             ; non-interlocked version would be
+        BEQL      L                   ; BLBC VAR, L
+        .ENDM     IF_CLR
+
+;++
+;
+;  In VAX multiprocessing system secondary processors do not have direct access to console
+;  and have to rely on the primary CPU to read from the console and write to the console
+;  using primary's console IO registers.
+;
+;      (Albeit on VAX MP secondaries can actully write to console using their own console 
+;       registers, but they still cannot read from the console.)
+;
+;  To perform console IO, secondary processors have to perform interprocessor requests to
+;  the primary that executes console IO on behalf of the requesting secondaries by writing to
+;  and reading from the primary's console registers and reporting results back to requesting
+;  secondaries. This is called virtual console mode.
+;
+;  Virtual console is composed of the protocol, set of virtcons virtual registers (VCREG_RXxxx
+;  and VCREG_TXxxx) and VIRTCONS spinlock. Access to virtual console and its data cells is guarded
+;  by VIRTCONS spinlock. Any secondary processor that needs to execute virtual console IO must
+;  acquire VIRTCONS spinlock first. VCREG registers mirror fields in VAX console registers.
+;
+;  Virtual console protocol is as follows:
+;
+;  1) SECONDARY acquires VIRTCONS spinlock and issues IP interrupt to the primary CPU.
+;     SECONDARY normally does it by calling CON$OWNCTY.
+;
+;  2) When PRIMARY receives IP interrupt, it checks if VIRTCONS spinlock is busy,
+;     and if so enters virtual console mode. It then performs the following loop:
+;
+;     while (VIRTCONS is busy)
+;     {
+;         /* if console reading is requested */
+;         if (VCREG_RXIE != 0)
+;         {
+;             VCREG_RXDB = get character from console
+;             VCREG_RXDONE = 1
+;             wait for the secondary to clear VCREG_RXDONE
+;         }
+;
+;         /* if console writing is requested */
+;         if (VCREG_TXIE != 0)
+;         {
+;             write to console character (VCREG_TXDB)
+;             VCREG_TXDONE = 1
+;             wait for the secondary to clear VCREG_TXDONE
+;         }
+;     }
+;
+;     Access to RXIE, TXIE, RXDONE and TXDONE is performed using interlocked instructions.
+;
+;     In particular, testing for value change is done with ADAWI #0, VAR. We could have also
+;     used non-interlocked instruction such as TSTB or BLBC for testing value change. The advantage
+;     of using interlocked instruction (ADAWI) for testing is shorter memory update propagation time
+;     between processors, which could be a tad longer (perhaps few to a few dozen VAX instruction
+;     cycles) in case if non-interlocked instruction was used. The disadvantage is that polling on
+;     a variable in a loop using interlocked instruction hogs down the bus by flooding it with cache
+;     coherence messages. We still go for interlocked testing because (1) there is only one hogger
+;     on each VAR at a time, so hogging may be not too bad (2) because there is only one processor
+;     polling for each VAR, all references to it could in fact stay intra CPU that owns particular
+;     cache line and any cross-processor exchange occur only when the value is actually changed,   
+;     (3) console IO is typcally not high volume in general, (4) it is better for console IO to
+;     complete as fast as possible so processor can go their own ways, (5) it is better for
+;     interprocessor exchange to that matter to complete as fast as possible.
+;
+;     When getting character from physical console, primary will spin until PR$_RXCS.RDY is set,
+;     then read PR$_RXDB.
+;
+;  3) To write character to the console, SECONDARY performs:
+;
+;         VCREG_TXDB = character
+;         VCREG_TXIE = 1
+;         wait for VXREG_TXDONE
+;         VCREG_TXIE = 0
+;         VCREG_TXDONE = 0
+;
+;  4) To read character from the console, SECONDARY performs:
+;
+;         VCREG_RXIE = 1
+;         wait for VXREG_RXDONE
+;         get character from VCREG_RXDB
+;         VCREG_RXIE = 0
+;         VCREG_RXDONE = 0
+;
+;  5) At the end of transfer, SECONDARY must release VIRTCONS spinlock.
+;     SECONDARY normally does it by calling CON$RELEASECTY.
+;
+;  Virtual registers thus logically mirror functions of physical console registers:
+;
+;      VCREG_RXDB         = PR$_RXDB
+;      VCREG_RXIE         = PR$_RXCS.IE
+;      VCREG_RXDONE       = PR$_RXCS.RDY
+;
+;      VCREG_TXDB         = PR$_TXDB
+;      VCREG_TXIE         = PR$_TXCS.IE
+;      VCREG_TXDONE       = PR$_TXCS.RDY
+;
+;--
+                                                               
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- data
+;;***********************************************************************************
+
+        .PSECT    KLOAD_DATA QUAD, PIC, EXE, NOSHR, WRT
+
+VCON$OLD_PUTCHAR::  .BLKL       ; address of old (SYSLOA650's) CON$PUTCHAR
+VCON$OLD_GETCHAR::  .BLKL       ; address of old (SYSLOA650's) CON$GETCHAR
+
+;
+;  When CON$OWNCTY and CON$RELEASECTY are called on the primary CPU,
+;
+;      OWNCTY will (or may) save original TXCS/RXCS to VC_SV_TXCS/RXCS
+;      RELEASECTY will (or may) restore TXCS/RXCS from VC_SV_TXCS/RXCS
+;
+;  If OWNCTY/RELEASECTY are called on the secondary CPU, primary will save its
+;  TXCS/RXCS to VC_SV_TXCS/RXCS when entering VSMP$VIRTCONS_SERVER and restore
+;  TXCS/RXCS back to saved values when exiting VSMP$VIRTCONS_SERVER.
+;
+;  Saving and restoring TXCS/RCXS preserves physical console's TXCS.IE and RXCS.IE.
+;  It may also save and restore other flags if this CPU type uses serial IO for console
+;  instead of standard internal processor registers (but VAX MP based on MicroVAX 3900
+;  i.e. KA650 uses the latter).
+;
+;  In either case, be it secondary or primary, OWNCTY will record caller's IPL at entrance
+;  to virtual console mode to VC_SV_IPL and elevate to VIRTCONS IPL. RELEASECTY will restore
+;  IPL back to the level previously recorded to VC_SV_IPL.
+;
+                .ALIGN  LONG
+
+VC_SV_IPL::     .LONG  0      ; recorded IPL at entry to VIRTCONS client mode (at CON$OWNCTY)
+VC_SV_TXCS::    .LONG  0      ; recorded TXCS (used on the primary only)
+VC_SV_RXCS::    .LONG  0      ; recorded RXCS (used on the primary only)
+
+;
+;  Virtual registers for console data
+;
+VCREG_TXDB::    .LONG   0     ; write buffer
+VCREG_RXDB::    .LONG   0     ; read data
+
+        .PSECT    KLOAD_DATA_PAGE PAGE, PIC, EXE, NOSHR, WRT
+;
+;  Below virtual console registers cells are accessed with ADAWI instruction and therefore
+;  must be properly aligned (to a word boundary each).  In addition, keep them isolated
+;  to a separate host CPU cache line: TXIE/RXIE in one cache line, TXDONE/RXDONE in another
+;  cache line from everything else. We do not know host cache line size, so use 512 bytes
+;  as hopefully sufficient.
+;
+                .ALIGN  PAGE
+
+VCREG_TXIE::    .WORD   0     ; write requested
+VCREG_RXIE::    .WORD   0     ; read requested
+
+                .ALIGN  PAGE
+
+VCREG_TXDONE::  .WORD   0     ; write serviced
+VCREG_RXDONE::  .WORD   0     ; read serviced
+
+                .ALIGN  PAGE
+                .BLKB   0
+
+;;***********************************************************************************
+;;  Kernel-resident part that is loaded into nonpaged memory -- code
+;;***********************************************************************************
+
+        .PSECT    KLOAD_CODE QUAD, PIC, EXE, SHR, NOWRT
+
+;
+;  Macro to get current CPU's physical node ID
+;
+        .MACRO    GET_CPU_NODE_ID  REG
+        MFPR      S^#PR$_CPUID, REG
+        .ENDM     GET_CPU_NODE_ID
+
+
+;++
+;
+; VCON$PUTCHAR - put a character to the console terminal
+;
+;     Output a character to the console terminal using non-interrupt driven output.
+;
+;     This routine is vectored via JSB G^CON$PUTCHAR.
+;
+; Inputs: 
+;
+;     R0 (low byte) = character to be output to the console.
+;     Access to console previously established by calling CON$OWNCTY.
+;
+; Outputs:
+;
+;     Character had been written to the OPA0: console terminal.
+;     All registers preserved.
+;     Access to console must be relinquished by calling CON$RELEASECTY.
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+VCON$PUTCHAR::
+        MOVL      R1,-(SP)                ; save scratch register
+        GET_CPU_NODE_ID  R1               ; get current CPU node ID
+        CMPL      R1, G^SMP$GL_PRIMID     ; are we in the primary CPU?
+        BEQL      20$                     ; eql - primary CPU
+;
+;  On a secondary CPU -- perform console IO by communicating with the primary CPU
+;  and requesting it to perform IO to its console on our behalf
+;
+        FIND_CPU_DATA R1                  ; locate CPU database
+        MOVL      R0, VCREG_TXDB          ; output to virtual register
+        DO_SET    VCREG_TXIE              ; signal write request
+        BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -      ; wait till primary signals 
+                  DONLBL=10$, -                      ; ...
+                  INST1=<IF_SET VCREG_TXDONE, 10$>   ; ... that data had been transmitted
+        DO_CLR    VCREG_TXIE              ; clear write request
+        DO_CLR    VCREG_TXDONE            ; clear ready 
+        MOVL      (SP)+, R1               ; restore scratch register
+        RSB                               ; return to the caller
+;
+;  On the primary CPU -- perform console IO via direct access to physical console
+;
+20$:    JSB       @VCON$OLD_PUTCHAR       ; call the original SYSLOAD650 routine
+        MOVL      (SP)+, R1               ; restore scratch register
+        RSB                               ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; VCON$GETCHAR - get a character from the console terminal
+;
+;     Get a character from the console using polled I/O.
+;
+;     This routine is vectored via JSB G^CON$GETCHAR.
+;
+; Inputs: 
+;
+;     Access to console previously established by calling CON$OWNCTY.
+;
+; Outputs:
+;
+;     R0 = character read.
+;     Access to console must be relinquished by calling CON$RELEASECTY.
+;
+;--
+        .ENABLE   LOCAL_BLOCK
+VCON$GETCHAR::
+        GET_CPU_NODE_ID  R0               ; get CPU node ID
+        CMPL      R0, G^SMP$GL_PRIMID     ; are we the primary?
+        BEQL      20$                     ; eql - yes, primary
+;
+;  On a secondary CPU -- perform console IO by communicating with the primary CPU
+;  and requesting it to perform IO to its console on our behalf
+;
+        PUSHL     R1                      ; preserve scratch register
+        DO_SET    VCREG_RXIE              ; signal read request
+        FIND_CPU_DATA   R0                ; locate CPU database
+        BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -      ; wait till primary signals
+                  DONLBL=10$, -                      ; ...
+                  CPUBASE=R0, -                      ; ...
+                  INST1=<IF_SET VCREG_RXDONE, 10$>   ; ... that read data is ready
+        MOVL      VCREG_RXDB, R0
+        DO_CLR    VCREG_RXIE               ; clear read request
+        DO_CLR    VCREG_RXDONE             ; clear ready
+        MOVL      (SP)+, R1                ; restore scratch register
+        RSB              
+;
+;  On the primary CPU -- perform console IO via direct access to physical console
+;
+20$:    JMP       @VCON$OLD_GETCHAR       ; call the original SYSLOAD650 routine
+                                          ; ... will return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; VCON$OWNCTY - reserve access to console terminal
+;
+;     Set up for performing non-interrupt driven I/O to the console.
+;
+;     Reserve exclusive ownership to the console by acquiring VIRTCONS spinlock, save previous
+;     console terminal state, disable interrupt-driven I/O, activate virtual console mode and 
+;     (if called on secondary CPU) send IP request to the primary CPU to enter virtual console
+;     server mode.
+;
+;     This routine is vectored via JSB G^CON$OWNCTY.
+;
+;     Proper calling sequence is:
+;
+;         CON$OWNCTY
+;         series of calls to CON$PUTCHAR and/or CON$GETCHAR
+;         CON$RELEASECTY
+;
+; Inputs:
+;
+;     Caller IPL must be <= console IPL, or caller must be a member of the override set.
+;
+; Outputs:
+;
+;     VIRTCONS spinlock is acquired.
+;     Virtual console mode is entered.
+;     VC_SV_IPL = saved IPL of the caller.
+;     All processor registers preserved.
+;
+;     If called on the primary CPU, additionally:
+;
+;         VC_SV_TXCS = value to be restored to PR$_TXCS when releasing the console
+;         VC_SV_RXCS = value to be restored to PR$_RXCS when releasing the console
+;
+;     If called on the secondary, primary's TXCS and RXCS will be saved and restored 
+;     by the primary's virtual console server loop.
+;
+;--
+        .ENABLE  LOCAL_BLOCK
+VCON$OWNCTY::
+        MOVQ      R0, -(SP)               ; save scratch registers
+        LOCK      LOCKNAME=VIRTCONS, -    ; reserve access to virtual console
+                  PRESERVE=NO, -          ; ... by acquiring VIRTCONS spinlock
+                  SAVIPL=VC_SV_IPL        ; ... also save caller's IPL to VC_SV_IPL
+;
+;  Check if we are on the primary CPU
+;
+        GET_CPU_NODE_ID  R0               ; get CPU node ID
+        CMPL      R0, G^SMP$GL_PRIMID     ; are we on the primary CPU?
+        BEQL      10$                     ; eql - yes, primary
+;
+;  We are on the secondary CPU
+;
+        CLRL      VCREG_TXDB              ; initialize virtcons registers
+        CLRW      VCREG_TXIE              ; ...
+        CLRW      VCREG_TXDONE            ; ...
+
+        CLRL      VCREG_RXDB              ; ...
+        CLRW      VCREG_RXIE              ; ...
+        CLRW      VCREG_RXDONE            ; ...
+
+        IPINT_CPU CPU=G^SMP$GL_PRIMID     ; request primary CPU to enter virtual console server mode
+
+        MOVQ      (SP)+,R0                ; restore scratch registers
+        RSB                               ; return to the caller
+;
+;  We are on the primary CPU
+;
+10$:
+        JSB       G^CON$SAVE_CTY          ; save original console state: call save routine
+        MOVL      R0, VC_SV_TXCS          ; store its results
+        MOVL      R1, VC_SV_RXCS          ; ...
+        MOVQ      (SP)+, R0               ; restore scratch registers
+        RSB                               ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; VCON$RELEASECTY - release console terminal
+;
+;     Relinquish exclusive use of the console previously obtained via CON$OWNCTY.  
+;
+;     This routine is vectored via JSB G^CON$RELEASECTY.
+;
+; Inputs:
+;
+;     VIRTCONS spinlock is held.
+;     VC_SV_IPL = IPL previously saved at entrance to CON$OWNCTY.
+;
+; Outputs:
+;
+;     VIRTCONS spinlock is released.
+;     IPL = VC_SV_IPL
+;     All processor registers preserved.
+;
+;     If called on the primary CPU, additionally:
+;
+;         PR$_TXCS = VC_SV_TXCS
+;         PR$_RXCS = VC_SV_RXCS
+;
+;     If called on the secondary, primary will exit console server state.
+;     Primary's TXCS and RXCS will be restored by the primary when it is exiting 
+;     virtual console server mode.
+;
+;--
+        .ENABLE  LOCAL_BLOCK
+VCON$RELEASECTY::
+        MOVQ      R0, -(SP)               ; save scratch registers
+;
+;  Check if we are on the primary CPU
+;
+        GET_CPU_NODE_ID  R0               ; get CPU node ID
+        CMPL      R0, G^SMP$GL_PRIMID     ; are we on the primary CPU?
+        BNEQ      10$                     ; neq - skip restore cty
+        MOVL      VC_SV_RXCS, R0          ; restore console state
+        MOVL      VC_SV_TXCS, R1          ; ...
+        JSB       G^CON$RESTORE_CTY       ; ...
+10$:    
+        UNLOCK    LOCKNAME=VIRTCONS, -    ; relase virtual console spinlock
+                  PRESERVE=NO, -          ; ...
+                  NEWIPL=VC_SV_IPL        ; ... and revert to IPL of OWNCTY
+        MOVQ      (SP)+, R0               ; restore scratch registers
+        RSB                               ; return to the caller
+        .DISABLE  LOCAL_BLOCK
+
+
+;++
+;
+; SMP$VIRTCONS_SERVER - service the virtual console IP request
+;
+;     This routine is invoked by interprocessor interrupt ISR.
+;     It is invoked only on the primary CPU.
+;
+; Inputs: 
+;
+;     R1 = CPU database address
+;
+; Outputs:
+;
+;     R0, R2 destroyed.
+;
+;--
+        .ENABLE  LOCAL_BLOCK
+VSMP$VIRTCONS_SERVER::
+;
+;  Check if VIRTCONS spinlock is owned. If it is owned, then virtual console service had
+;  been requested by secondary processor. If the spinlock is not owned, there is no request
+;  for virtual console, in this case just exit.
+;
+;  Note that IPINT performs write memory barrier on the sending processor side, and receiving 
+;  any interrupt performs read memory barrier on receiving processor side, so "weak" (plain
+;  read) check is sufficient.
+;
+        MOVZBL    #SPL$C_VIRTCONS, R0     ; get address of VIRTCONS spinlock
+        MOVL      G^SMP$AR_SPNLKVEC, R2   ; ...
+        MOVL      (R2)[R0], R0            ; ...
+        TSTW      SPL$W_OWN_CNT(R0)       ; check whether the spinlock is owned
+        BGEQ      10$                     ; geq - yes                   
+        RSB                               ; no - return
+;
+;  Set up for the virtual console server loop.
+;
+;  Save the state of physical console (primarily for RCXS.IE and TXCS.IE).
+;  Console will be restored to this state when exiting virtual console server mode.
+;
+10$:    PUSHL     R1                      ; save register
+        JSB       G^CON$SAVE_CTY          ; disable console interrupts
+                                          ; ... and get TXCS/RXCS registers
+        MOVL      R0, VC_SV_TXCS          ; save TXCS value
+        MOVL      R1, VC_SV_RXCS          ; save RXCS value
+;
+;  Enter virtual console server loop.
+;  While inside the loop:
+;
+;      Check for XDELTA being active on another CPU.
+;      If XDELTA is active, temporarily enter bening state until resumed from the debugger.
+;
+;      Service TBIS IP interrupt. When another CPU sends this request, it expects ACK,
+;      so process the request to provide needed ACK to the requesting processor.
+;
+;      Service BUGCHECK IP interrupt.
+;
+;      Service virtual read and write request.
+;
+;      Check for virtual console mode been exited.
+;
+20$:
+        MOVL      (SP), R1                ; R1 = CPU database address
+;
+;  Process any pending XDELTA, BUGCHECK or TBIS requests.
+;
+        XDELTA_WAIT                       ; if XDelta is active, temporarily enter bening state
+        BBC       #CPU$V_BUGCHK, -        ; has bugcheck been requested?
+                  CPU$L_WORK_REQ(R1), 30$ ; ...
+        BUG_CHECK CPUEXIT,FATAL           ; join the bugcheck processing, never returns
+30$:    
+        BBCCI     #CPU$V_INV_TBS, -       ; has another processor requested TBIS?
+                  CPU$L_WORK_REQ(R1), 40$ ; ...
+        JSB       G^SMP$INVALID_SINGLE    ; process the request
+;
+;  Check if virtual console read had been requested. 
+;
+40$:    
+        IF_CLR    VCREG_RXIE, 50$         ; vc read requested?
+                                          ; ... clr - no, proceed with other checks
+        BSBW      VCON$GETCHAR            ; read character from physical console
+        MOVL      R0, VCREG_RXDB          ; store read character in virtual register
+        DO_SET    VCREG_RXDONE            ; signal vc client that read data is available
+        BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -       ; wait for secondary to ack receiving data
+                  DONLBL=45$, -                       ; ...
+                  INST1=<IF_CLR VCREG_RXDONE, 45$>    ; ...
+;
+;  Check if virtual console write had been requested. 
+;
+50$:    
+        IF_CLR    VCREG_TXIE, 60$         ; vc write requested?
+                                          ; ... clr - no, proceed with other checks
+        MOVL      VCREG_TXDB, R0          ; character to write
+        BSBW      VCON$PUTCHAR            ; write to physical console
+        DO_SET    VCREG_TXDONE            ; signal to vc client: writing done
+        BUSYWAIT  TIME=G^SGN$GL_SMP_SPINWAIT, -       ; wait for secondary to ack
+                  DONLBL=55$, -                       ; ...
+                  INST1=<IF_CLR VCREG_TXDONE, 55$>    ; ...
+;
+;  Check if secondary exited virtual console mode. 
+;
+60$:    
+        MOVZBL    #SPL$C_VIRTCONS, R0     ; get address of VIRTCONS spinlock
+        MOVL      G^SMP$AR_SPNLKVEC, R2   ; ...
+        MOVL      (R2)[R0], R0            ; ...
+        TSTW      SPL$W_OWN_CNT(R0)       ; checked whether spinlock is still owned
+        XBGEQ     20$                     ; geq - yes, continue virtcons server loop
+;
+;  VIRTCONS spinlock was released by the secondary. Exit virtual console mode and
+;  restore the state of the physical console interface to the previously saved state
+;  before entering virtcons server loop.
+;
+        MOVL      VC_SV_TXCS, R0          ; get saved TXCS/RXCS
+        MOVL      VC_SV_RXCS, R1          ; ...
+        JSB       G^CON$RESTORE_CTY       ; restore physical console state
+        MOVL      (SP)+, R1               ; resore scratch register
+        RSB                               ; return back to the caller
+        .DISABLE  LOCAL_BLOCK
+
+        .END
