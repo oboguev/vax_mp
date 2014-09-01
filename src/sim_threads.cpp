@@ -3641,11 +3641,14 @@ static t_bool smp_init_info()
     char* xp;
     char* key;
     char* value;
-    int hi_core = 255;
-    int* p_smt = (int*) malloc(sizeof(int) * (hi_core + 1));
+    int hi_phys_id = 255;
+    int hi_core_id = 31;
+    int** p_smt = NULL;
     int cpu_id = -1;
     int phys_id = -1;
     cpu_set_t core_set;
+    int k, j;
+    int* p_core;
 
     smp_ncores = 0;
     CPU_ZERO(& smp_core_cpu_set);
@@ -3654,8 +3657,10 @@ static t_bool smp_init_info()
 
     CHECK(fd);
 
+    /* allocate array to count SMT factor (CPUs per core) */
+    p_smt = (int**) malloc(sizeof(int*) * (hi_phys_id + 1));
     CHECK(p_smt);
-    memset(p_smt, 0, sizeof(int) * (hi_core + 1));
+    memset(p_smt, 0, sizeof(int*) * (hi_phys_id + 1));
 
     while (fgets(buffer, sizeof(buffer), fd))
     {
@@ -3697,6 +3702,15 @@ static t_bool smp_init_info()
             phys_id = -1;
             CHECK(1 == sscanf(value, "%d", & phys_id));
             CHECK(phys_id >= 0);
+
+            if (phys_id > hi_phys_id)
+            {
+                int** np = (int**) realloc(p_smt, sizeof(int*) * (phys_id + 1));
+                CHECK(np);
+                memset(np + hi_phys_id + 1, 0, sizeof(int*) * (phys_id - hi_phys_id));
+                p_smt = np;
+                hi_phys_id = phys_id;
+            }
         }
         else if (streqi(key, "core id"))
         {
@@ -3705,18 +3719,34 @@ static t_bool smp_init_info()
             int core_id = -1;
             CHECK(1 == sscanf(value, "%d", & core_id));
             CHECK(core_id >= 0);
-            if (core_id >= hi_core)
+            CHECK(phys_id >= 0);
+
+            if (! p_smt[phys_id])
             {
-                int new_hi_core = (hi_core * 2 + 1) - 1;
-                if (core_id >= new_hi_core)
-                    new_hi_core = core_id;
-                int* np = (int*) realloc(p_smt, sizeof(int) * (new_hi_core + 1));
-                CHECK(np);
-                memset(np + hi_core + 1, 0, sizeof(int) * (new_hi_core - hi_core));
-                p_smt = np;
-                hi_core = new_hi_core;
+                p_smt[phys_id] = (int*) malloc(sizeof(int) * (hi_core_id + 1));
+                CHECK(p_smt[phys_id]);
+                memset(p_smt[phys_id], 0, sizeof(int) * (hi_core_id + 1));
             }
-            p_smt[core_id]++;
+
+            if (core_id > hi_core_id)
+            {
+                int new_hi_core_id = hi_core_id * 2;
+                if (core_id >= new_hi_core_id)
+                    new_hi_core_id = core_id;
+
+                for (k = 0;  k <= hi_phys_id;  k++)
+                {
+                    int* np = (int*) realloc(p_smt[k], sizeof(int) * (new_hi_core_id + 1));
+                    CHECK(np);
+                    memset(np + hi_core_id + 1, 0, sizeof(int) * (new_hi_core_id - hi_core_id));
+                    p_smt[k] = np;
+                }
+
+                hi_core_id = new_hi_core_id;
+            }
+
+            p_core = p_smt[phys_id];
+            p_core[core_id]++;
 
             /*
              * currently limited to:
@@ -3740,10 +3770,16 @@ static t_bool smp_init_info()
 
     CHECK(! ferror(fd));
 
-    for (int k = 0;  k <= hi_core;  k++)
+    for (k = 0;  k <= hi_phys_id;  k++)
     {
-        if (p_smt[k] > max_per_core)
-            max_per_core = p_smt[k];
+        if (! (p_core = p_smt[k]))
+            continue;
+
+        for (int j = 0;  j <= hi_core_id;  j++)
+        {
+            if (p_core[j] > max_per_core)
+                max_per_core = p_core[j];
+        }
     }
 
     /* in case "core id" is not reported */
@@ -3766,8 +3802,17 @@ cleanup:
 
     if (fd)
         fclose(fd);
+
     if (p_smt)
+    {
+        for (k = 0;  k <= hi_phys_id;  k++)
+        {
+            if (p_smt[k])
+                free(p_smt[k]);
+        }
+
         free(p_smt);
+    }
 
 
     return done;

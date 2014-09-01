@@ -545,7 +545,6 @@ void rom_wr_B (RUN_DECL, int32 pa, int32 val)
 
 t_stat rom_ex (t_value *vptr, t_addr exta, UNIT *uptr, int32 sw)
 {
-    RUN_SCOPE;
     uint32 addr = (uint32) exta;
 
     if ((vptr == NULL) || (addr & 03))
@@ -560,7 +559,6 @@ t_stat rom_ex (t_value *vptr, t_addr exta, UNIT *uptr, int32 sw)
 
 t_stat rom_dep (t_value val, t_addr exta, UNIT *uptr, int32 sw)
 {
-    RUN_SCOPE;
     uint32 addr = (uint32) exta;
 
     if (addr & 03)
@@ -575,7 +573,6 @@ t_stat rom_dep (t_value val, t_addr exta, UNIT *uptr, int32 sw)
 
 t_stat rom_reset (DEVICE *dptr)
 {
-    RUN_SCOPE;
     if (rom == NULL)
         rom = (uint32*) calloc (ROMSIZE >> 2, sizeof (uint32));
     if (rom == NULL)
@@ -620,7 +617,6 @@ void nvr_wr (RUN_DECL, int32 pa, int32 val, int32 lnt)
 
 t_stat nvr_ex (t_value *vptr, t_addr exta, UNIT *uptr, int32 sw)
 {
-    RUN_SCOPE;
     uint32 addr = (uint32) exta;
 
     if ((vptr == NULL) || (addr & 03))
@@ -635,7 +631,6 @@ t_stat nvr_ex (t_value *vptr, t_addr exta, UNIT *uptr, int32 sw)
 
 t_stat nvr_dep (t_value val, t_addr exta, UNIT *uptr, int32 sw)
 {
-    RUN_SCOPE;
     uint32 addr = (uint32) exta;
 
     if (addr & 03)
@@ -650,7 +645,6 @@ t_stat nvr_dep (t_value val, t_addr exta, UNIT *uptr, int32 sw)
 
 t_stat nvr_reset (DEVICE *dptr)
 {
-    RUN_SCOPE;
     AUTO_LOCK(sysd_lock);
     sim_bind_devunits_lock(&nvr_dev, sysd_lock);
     if (nvr == NULL)
@@ -1489,8 +1483,23 @@ int32 tmr_tir_rd (RUN_DECL, int32 tmr, t_bool interp)
         ABORT_INVALID_SYSOP;
     }
 
-    t_bool rom_test = (mapen == 0) && ADDR_IS_ROM(PC);
-    if (! rom_test)
+    /*
+     * There are several users of SSC clocks on a VAX/VMS system:
+     *
+     *     - Firmware ROM self-test (mapen = 0, PC in ROM)
+     *     - Remote bootstrap via Ethernet (>>> B XQ) (mapen = 0, PC in ROM and RAM)
+     *       Note: Ethernet bootstrap uses XFR | RUN | STP
+     *     - Firmware boot and early SYSBOOT (mapen = 0, PC in ROM and RAM)
+     *     - OpenVMS kernel (mapen = 1, PC in S0)
+     *
+     * We use actual real-time data for SSC emulation only during OpenVMS SMP loops calibration.
+     *
+     * Apart from early stages of SYSBOOT (before the SYSBOOT prompt), OpenVMS calls only
+     * with virtual mapping enabled (mapen=1) and uses only TMR0.
+     */
+
+    t_bool is_realtime = (mapen == 1);
+    if (is_realtime)
         return tmr_tir_rd_realtime(RUN_PASS, tmr);
 
     uint32 delta;
@@ -1514,7 +1523,7 @@ int32 tmr_tir_rd (RUN_DECL, int32 tmr, t_bool interp)
 
     /*
      * ROM Test 31 tends to fail when SYNCLK is used because its tolerances are
-     * very tight (tighter than 0.15%). Just put out know good values for it,
+     * very tight (tighter than 0.15%). Just put out known good values for it,
      * to suppress annoying (but harmless) message about test failure.
      */
     if (tmr == 1 && mapen == 0 && use_clock_thread)
@@ -1555,9 +1564,8 @@ void tmr_csr_wr (RUN_DECL, int32 tmr, int32 val)
         ABORT_INVALID_SYSOP;
     }
 
-    /* do not elevate thread priority for ROM tests */
-    t_bool rom_test = (mapen == 0) && ADDR_IS_ROM(PC);
-    t_bool is_realtime = !rom_test;
+    /* do not elevate thread priority for ROM tests and Ethernet bootstrap */
+    t_bool is_realtime = (mapen == 1);
 
     if (is_realtime)
     {

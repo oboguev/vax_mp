@@ -1,0 +1,13 @@
+3.8.3 (1)
+
+    Properly enumerate host CPUs on multi-socket host machine under Linux.
+    Prior to this fix, SMT factor was incorrectly calculated on such a machine,
+    and if hyperthreading was enabled, VAX MP would refuse to run in SMP mode.
+
+    Fix Ethernet bootstrap (>>> B XQ).
+    Prior to this fix, VAX MP would not boot over Ethernet due to
+    "unexpected system operation" abort in SSC clock code.
+
+3.8.3
+
+    The original release.

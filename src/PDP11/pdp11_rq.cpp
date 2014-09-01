@@ -1145,7 +1145,7 @@ t_stat rq_rd (int32 *data, int32 PA, int32 access)
 
 t_stat rq_wr (int32 data, int32 PA, int32 access)
 {
-    RUN_SCOPE;
+    RUN_SCOPE_RSCX_ONLY;
     int32 cidx = rq_map_pa ((uint32) PA);
     if (cidx < 0)
         return SCPE_IERR;

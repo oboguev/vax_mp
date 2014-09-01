@@ -30,11 +30,22 @@
 #define SIM_MAJOR       3
 #define SIM_MINOR       8
 #define SIM_PATCH       3
-#define SIM_DELTA       0
+#define SIM_DELTA       1
 
 #if defined(VM_VAX_MP)
 #  define VSMP_REVISION 1
 #endif
+
+/*
+ * Delta 3.8.3 (1)
+ *
+ *    Properly enumerate host CPUs on multi-socket configration under Linux.
+ *    Prior to the fix, SMT factor was incorrectly calculated on such a machine.
+ *
+ *    Fix Ethernet bootstrap (>>> B XQ).
+ *    Prior to the fix, VAX MP would not boot over Ethernet due to
+ *    "unsupported operation" abort in SSC clock code.
+ */
 
 /* V3.8 revision history
 
