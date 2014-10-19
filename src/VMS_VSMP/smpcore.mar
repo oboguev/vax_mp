@@ -90,7 +90,17 @@ VSMP$INTPROC::                                   ; interrupt the specified proce
 ;
 ; Inputs: 
 ;
-;     IPL is ASTDEL or above
+;     IPL is ASTDEL or above (per interface spec, but see NB below)
+;
+;     NB: All existing implementations for various CPUs in [SYSLOA.SRC]SMPINT_xxx.MAR actually
+;         assume caller IPL is RESCHED or above and do not elevate the IPL to prevent the
+;         rescheduling in between FIND_CPU_DATA, BICL3 current CPU ID from the signalling mask,
+;         sending the IPI interrupt request and returning to the caller for local processing.
+;         We do not try to be hollier than the implementations for the existing CPUs and follow
+;         the same pattern as they do. This means however that the caller of IPINT_ALL ACQUIRE=NO
+;         must actually be executing at IPL RESCHED or above. Also the caller performing local
+;         processing must elevate to IPL RESCHED or above to synchronize the processing on
+;         the local CPU with sending IPI request to the other CPUs.
 ;
 ;--
         .ENABLE   LOCAL_BLOCK
@@ -123,7 +133,17 @@ VSMP$INTALL::                                    ; interrupt all processors
 ; Inputs: 
 ;
 ;     R2 = work request bit to set
-;     IPL is ASTDEL or above
+;     IPL is ASTDEL or above (per interface spec, but see NB below)
+;
+;     NB: All existing implementations for various CPUs in [SYSLOA.SRC]SMPINT_xxx.MAR actually
+;         assume caller IPL is RESCHED or above and do not elevate the IPL to prevent the
+;         rescheduling in between FIND_CPU_DATA, BICL3 current CPU ID from the signalling mask,
+;         sending the IPI interrupt request and returning to the caller for local processing.
+;         We do not try to be hollier than the implementations for the existing CPUs and follow
+;         the same pattern as they do. This means however that the caller of IPINT_ALL ACQUIRE=NO
+;         must actually be executing at IPL RESCHED or above. Also the caller performing local
+;         processing must elevate to IPL RESCHED or above to synchronize the processing on
+;         the local CPU with sending IPI request to the other CPUs.
 ;
 ;--
         .ENABLE   LOCAL_BLOCK
