@@ -1,3 +1,9 @@
+3.8.3 (2)
+
+    Fix CPU toplogy recognition in the case of non-hyperthreaded processors under Windows.
+    Prior to this fix VAX MP would refuse to enable multiprocessing
+    via CPU MULTI <n> command in the described configuration.
+
 3.8.3 (1)
 
     Properly enumerate host CPUs on multi-socket host machine under Linux.
