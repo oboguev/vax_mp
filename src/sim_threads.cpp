@@ -2041,6 +2041,10 @@ static t_bool smp_init_info()
         }
     }
 
+    /* non-hyperthreaded processors */
+    if (max_per_core == 0)
+        max_per_core = 1;
+
     free(pBuffer);
 
     smp_smt_per_core = max_per_core;
